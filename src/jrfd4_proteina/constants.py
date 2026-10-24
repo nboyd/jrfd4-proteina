@@ -1,0 +1,21 @@
+"""Constants mirrored from the RFD4-Proteina reference (`rfproteina`, `atomworks`)."""
+
+N_RESIDUE_TYPES = 147  # UNIFIED_ATOM37_ENCODING.n_tokens
+MASK_RESIDUE = 0  # UNIFIED_ATOM37_ENCODING.token_to_idx["<M>"]
+N_TOKEN_TYPES = 7
+TOKEN_TYPE_ATOMIZED = 3
+
+UNKNOWN_COORDS = -1  # C_CRDGRP.UNKNOWN_COORDS
+KNOWN_ABSOLUTE_COORDS = 0  # C_CRDGRP.KNOWN_ABSOLUTE_COORDS
+
+HBOND_DONOR, HBOND_ACCEPTOR, HBOND_BOTH = 1, 2, 3
+PICATION_AROMATIC, PICATION_CATION, PICATION_BOTH = 1, 2, 3
+RASA_UNSPECIFIED = 0
+
+MAX_CHIRAL_CENTERS = 6  # transforms.chirality_feature.MAX_OVERLAPPING_CENTERS
+
+# Order of `SEQUENCE_PROBABILITY_CONDITIONS` (the feature's channel order).
+SEQUENCE_PROBABILITY_RESIDUES = (
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE",
+    "PRO", "SER", "THR", "TRP", "TYR", "VAL", "A", "C", "G", "U", "DA", "DC", "DG", "DT",
+)
