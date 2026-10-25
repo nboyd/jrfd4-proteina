@@ -35,6 +35,19 @@ def reference(jax_cpu_highest):
     return torch_model, jax_model, torch_batch, convert.batch_from_reference(torch_batch)[0]
 
 
+@pytest.fixture(scope="session")
+def pdl1_reference(reference):
+    """As `reference`, for the reference's PD-L1 binder example (two molecules, coordinate group, hotspots)."""
+    import random
+
+    from jrfd4_proteina import convert
+
+    torch_model, jax_model, _, _ = reference
+    random.seed(0)  # the binder length is sampled from the contig with `random`
+    torch_batch = _reference_batch(str(Path(__file__).parent / "data" / "pdl1_binder.yaml"))
+    return torch_model, jax_model, torch_batch, convert.batch_from_reference(torch_batch)[0]
+
+
 def _reference_batch(inputs: str) -> dict:
     from hydra import compose, initialize_config_dir
     from rfproteina.datapipes.collate import collate_batch

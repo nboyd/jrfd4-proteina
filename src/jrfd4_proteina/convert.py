@@ -2,16 +2,20 @@
 
     from jrfd4_proteina import convert
     model = convert.load("nvidia/RFD4-Proteina")          # Hugging Face repo or local bundle
-    batch = convert.featurize("design.yaml")[0]           # reference featurization of a design spec
+    batch = convert.featurize({"design": spec})[0]        # reference featurization of a condition spec
 """
 
 from __future__ import annotations
 
+import copy
 import os
-from collections.abc import Sequence
+import random
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 import jax.numpy as jnp
+import numpy as np
 import torch
 
 import jrfd4_proteina.features
@@ -82,21 +86,44 @@ def reference_config_dir() -> Path:
     return Path(rfproteina.__file__).parent / "configs"
 
 
-def featurize(inputs: str | os.PathLike, overrides: Sequence[str] = ()) -> list[Batch]:
-    """Featurize a design spec (YAML/JSON/annotated CIF) with the reference data pipeline."""
-    from hydra import compose, initialize_config_dir
+@contextmanager
+def _seeded(seed: int | None) -> Iterator[None]:
+    """Seed the global RNGs the reference pipeline draws from, restoring their states afterwards."""
+    if seed is None:
+        yield
+        return
+    states = random.getstate(), np.random.get_state()
+    random.seed(seed)  # contig lengths are sampled with `random`, free-pose internal coordinates with torch
+    np.random.seed(seed)
+    try:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            yield
+    finally:
+        random.setstate(states[0])
+        np.random.set_state(states[1])
+
+
+def featurize(spec: Mapping[str, Mapping], *, seed: int | None = None) -> list[Batch]:
+    """Featurize a condition spec with the reference data pipeline, one `Batch` per example.
+
+    `spec` is the reference's condition-spec YAML as a dict, `{example_id: {"input": ..., "contig": ...,
+    "conditions": ...}}`; relative `input` paths resolve against the working directory. Contig length ranges
+    are sampled anew on each call; `seed` makes that reproducible without touching the global RNG states.
+    """
     from rfproteina.datapipes.collate import collate_batch
-    from rfproteina.generate import get_dataset_from_cfg
+    from rfproteina.datapipes.pipeline import build_design_validation_pipeline
+    from rfproteina.inference_utils.datasets import ConditionSpecDataset
 
     os.environ.setdefault("DATA_PATH", str(Path.home() / ".cache" / "jrfd4_proteina"))
-    with initialize_config_dir(config_dir=str(reference_config_dir()), version_base="1.3"):
-        cfg = compose("inference", overrides=[f"inputs={inputs}", "num_replicates=1", "~metrics", *overrides])
-    dataset = get_dataset_from_cfg(cfg, 0)
     batches = []
-    for i in range(len(dataset)):
-        collated = collate_batch(
-            [dataset[i]], schema="rfproteina.datapipes.schema.proteina.ProteinaDataSample", fixed_dimensions=None
+    with _seeded(seed):
+        dataset = ConditionSpecDataset(
+            data=copy.deepcopy(dict(spec)), transform=build_design_validation_pipeline(), name="jrfd4-proteina"
         )
-        batches.extend(batch_from_reference(collated))
+        for i in range(len(dataset)):
+            collated = collate_batch(
+                [dataset[i]], schema="rfproteina.datapipes.schema.proteina.ProteinaDataSample", fixed_dimensions=None
+            )
+            batches.extend(batch_from_reference(collated))
     return batches
-

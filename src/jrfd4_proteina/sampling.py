@@ -1,12 +1,15 @@
-"""Flow-matching sampler (the reference's `ProductSpaceFlowMatcher.full_simulation`) and decoding.
+"""Flow-matching sampler (the reference's `ProductSpaceFlowMatcher.full_simulation` / `partial_simulation`) and
+decoding.
 
 Two modalities are integrated jointly from t=0 (noise) to t=1 (data): CA coordinates (nm) and local
 latents. Each step evaluates the flow network at a recycle depth fixed by a banded schedule; each band
-is one `lax.scan`, so the whole sampler is jittable and reverse-mode differentiable.
+is one `lax.scan`, so the whole sampler is jittable and reverse-mode differentiable. `simulate` runs any
+contiguous slice of a `Schedule` from a given `State`, which is what partial diffusion and search build on.
 """
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 import equinox as eqx
@@ -124,30 +127,146 @@ def noise_schedule(cfg: ModalityConfig, t: np.ndarray) -> np.ndarray:
     return g.astype(np.float32)
 
 
+class Schedule(eqx.Module):
+    """Per-step times, noise scales and recycle depths, columns (bb_ca, local_latents). Slice with `[a:b]`."""
+
+    t: Float[Array, "S 2"]  # step start times
+    t_next: Float[Array, "S 2"]
+    g: Float[Array, "S 2"]
+    stochastic: Bool[Array, "S 2"]
+    depths: tuple[int, ...] = eqx.field(static=True)  # trunk passes per step
+
+    def __getitem__(self, steps: slice) -> Schedule:
+        return Schedule(self.t[steps], self.t_next[steps], self.g[steps], self.stochastic[steps], self.depths[steps])
+
+    def __len__(self) -> int:
+        return len(self.depths)
+
+    @property
+    def bands(self) -> tuple[tuple[int, int], ...]:
+        """Runs of equal depth, as (number of steps, depth)."""
+        return tuple((len(list(run)), depth) for depth, run in itertools.groupby(self.depths))
+
+
+def _schedule_from_times(config: SamplingConfig, times: tuple[np.ndarray, np.ndarray], depths) -> Schedule:
+    gs, stoch = [], []
+    for cfg, t in zip((config.bb_ca, config.local_latents), times, strict=True):
+        gs.append(noise_schedule(cfg, t[:-1]))
+        stoch.append((t[:-1] <= cfg.t_lim_ode) & (t[:-1] >= cfg.t_lim_ode_below) & (cfg.sampling_mode == "vf_tsr"))
+    t = np.stack(times, -1)
+    return Schedule(t[:-1], t[1:], np.stack(gs, -1), np.stack(stoch, -1), tuple(depths))
+
+
+def _recycle_depths(config: SamplingConfig) -> tuple[int, ...]:
+    depths = tuple(depth for width, depth in config.recycle_schedule for _ in range(width))
+    if len(depths) != config.nsteps:
+        raise ValueError(f"recycle schedule covers {len(depths)} steps, expected {config.nsteps}")
+    return depths
+
+
+def schedule(config: SamplingConfig) -> Schedule:
+    """The full `config.nsteps`-step schedule from ~0 to 1."""
+    times = (time_schedule(config.bb_ca, config.nsteps), time_schedule(config.local_latents, config.nsteps))
+    return _schedule_from_times(config, times, _recycle_depths(config))
+
+
+def partial_schedule(
+    config: SamplingConfig,
+    *,
+    fraction: float | None = None,
+    t_bb_ca: float | None = None,
+    t_local_latents: float | None = None,
+) -> tuple[Schedule, np.ndarray]:
+    """Schedule and start times `[2]` for partial diffusion (the reference's `resolve_partial_t` and
+    `build_partial_schedule`).
+
+    Either `fraction`, to run the final `round(fraction * nsteps)` steps of the full schedule
+    (`partial_trajectory_fraction_steps`), or start times, to run `nsteps` steps from them. Given only one
+    time, the other is read at the same position of a dense schedule (`couple_partial_t`).
+    """
+    if fraction is not None:
+        if t_bb_ca is not None or t_local_latents is not None:
+            raise ValueError("fraction is mutually exclusive with start times")
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+        remaining = round(fraction * config.nsteps)
+        if remaining < 1:
+            raise ValueError(f"fraction={fraction} with nsteps={config.nsteps} rounds to zero steps")
+        sched = schedule(config)[config.nsteps - remaining :]
+        return sched, _check_start(np.asarray(sched.t[0]))
+
+    if t_bb_ca is None and t_local_latents is None:
+        raise ValueError("give fraction or at least one start time")
+    if t_bb_ca is None or t_local_latents is None:
+        ref_nsteps = 10000
+        refs = [time_schedule(cfg, ref_nsteps) for cfg in (config.bb_ca, config.local_latents)]
+        which, value = (0, t_bb_ca) if t_bb_ca is not None else (1, t_local_latents)
+        above = refs[which] >= value - 1e-6
+        k = int(np.argmax(above)) if above.any() else ref_nsteps
+        start = np.array([refs[0][k], refs[1][k]], np.float32)
+    else:
+        start = np.array([t_bb_ca, t_local_latents], np.float32)
+    _check_start(start)
+
+    n = config.nsteps
+    dense_n = max(n * 100, 1000)
+    times = []
+    for cfg, t0 in zip((config.bb_ca, config.local_latents), start, strict=True):
+        above = time_schedule(cfg, dense_n) >= t0 - 1e-6
+        n_above = max(dense_n - (int(np.argmax(above)) if above.any() else dense_n), 1)
+        times.append(time_schedule(cfg, round(n * dense_n / n_above))[-(n + 1) :])
+    return _schedule_from_times(config, tuple(times), _recycle_depths(config)), start
+
+
+def _check_start(start: np.ndarray) -> np.ndarray:
+    if (start >= 1.0).any():
+        raise ValueError(f"partial-diffusion start times must be < 1, got {start}")
+    return start
+
+
 # --------------------------------------------------------------------------- noise
 
 
+class StepNoise(eqx.Module):
+    """Per-step random draws (standard normal / uniform)."""
+
+    bb_ca: Float[Array, "S N 3"]
+    local_latents: Float[Array, "S N L"]
+    coord_group_priority: Float[Array, "S K"]  # per-call coordinate-group relabelling
+    # Forward-marginal backbone draws, used only when inverse folding (`fixed_bb_ca`)
+    marginal_bb_ca: Float[Array, "S N 3"]
+    marginal_offsets: Float[Array, "S G 3"]
+
+
 class Noise(eqx.Module):
-    """Every random draw of one sampling run (standard normal / uniform)."""
+    """Every random draw of one sampling run."""
 
     bb_ca: Float[Array, "N 3"]
     local_latents: Float[Array, "N L"]
     group_offsets: Float[Array, "G 3"]  # one per centering group, in sorted group order
-    steps_bb_ca: Float[Array, "S N 3"]
-    steps_local_latents: Float[Array, "S N L"]
-    coord_group_priority: Float[Array, "S K"]  # per-call coordinate-group relabelling
+    steps: StepNoise
+
+
+def draw_steps(key: PRNGKeyArray, batch: Batch, *, nsteps: int, latent_dim: int) -> StepNoise:
+    n = batch.padding_mask.shape[0]
+    keys = jax.random.split(key, 5)
+    return StepNoise(
+        bb_ca=jax.random.normal(keys[0], (nsteps, n, 3)),
+        local_latents=jax.random.normal(keys[1], (nsteps, n, latent_dim)),
+        coord_group_priority=jax.random.uniform(keys[2], (nsteps, batch.coord_group.size)),
+        marginal_bb_ca=jax.random.normal(keys[3], (nsteps, n, 3)),
+        marginal_offsets=jax.random.normal(keys[4], (nsteps, n, 3)),
+    )
 
 
 def draw_noise(key: PRNGKeyArray, batch: Batch, *, nsteps: int, latent_dim: int) -> Noise:
     n = batch.padding_mask.shape[0]
-    keys = jax.random.split(key, 6)
+    keys = jax.random.split(key, 4)
     return Noise(
         bb_ca=jax.random.normal(keys[0], (n, 3)),
         local_latents=jax.random.normal(keys[1], (n, latent_dim)),
         group_offsets=jax.random.normal(keys[2], (n, 3)),
-        steps_bb_ca=jax.random.normal(keys[3], (nsteps, n, 3)),
-        steps_local_latents=jax.random.normal(keys[4], (nsteps, n, latent_dim)),
-        coord_group_priority=jax.random.uniform(keys[5], (nsteps, batch.coord_group.size)),
+        steps=draw_steps(keys[3], batch, nsteps=nsteps, latent_dim=latent_dim),
     )
 
 
@@ -155,23 +274,46 @@ def masked_mean(x: Float[Array, "N D"], mask: Bool[Array, " N"]) -> Float[Array,
     return (x * mask[:, None]).sum(0) / jnp.maximum(mask.sum(), 1)
 
 
-def initial_state(
-    batch: Batch, noise: Noise, bb_ca: NoiseConfig, local_latents: NoiseConfig
-) -> tuple[Float[Array, "N 3"], Float[Array, "N L"]]:
-    emit_bb, emit_lat = flow_emit_masks(batch)
-    x_bb = noise.bb_ca * emit_bb[:, None]
-    if bb_ca.zero_com:
+class State(eqx.Module):
+    """The integrated state between steps (sampler units: CA in nm)."""
+
+    bb_ca: Float[Array, "N 3"]
+    local_latents: Float[Array, "N L"]
+
+
+def _bb_ca_noise(batch: Batch, eps: Float[Array, "N 3"], offsets: Float[Array, "G 3"], cfg: NoiseConfig):
+    """x_0 for the CA modality: masked, optionally zero-COM, plus a stochastic offset per centering group."""
+    emit_bb, _ = flow_emit_masks(batch)
+    x_bb = eps * emit_bb[:, None]
+    if cfg.zero_com:
         x_bb = (x_bb - masked_mean(x_bb, emit_bb)) * emit_bb[:, None]
-    if bb_ca.centering_scale is not None:
+    if cfg.centering_scale is not None:
         offset_mask = emit_bb & ~batch.coord_cond_mask
         ids = batch.molecule_iid.astype(jnp.int32)
         big = jnp.iinfo(jnp.int32).max
         groups = jnp.unique(jnp.where(offset_mask, ids, big), size=ids.shape[0], fill_value=big)
-        offset = noise.group_offsets[jnp.searchsorted(groups, ids)] * offset_mask[:, None]
-        x_bb = (x_bb + bb_ca.centering_scale * offset) * emit_bb[:, None]
+        offset = offsets[jnp.searchsorted(groups, ids)] * offset_mask[:, None]
+        x_bb = (x_bb + cfg.centering_scale * offset) * emit_bb[:, None]
+    return x_bb
+
+
+def initial_state(batch: Batch, noise: Noise, bb_ca: NoiseConfig, local_latents: NoiseConfig) -> State:
+    _, emit_lat = flow_emit_masks(batch)
     if local_latents.zero_com or local_latents.centering_scale is not None:
         raise NotImplementedError("latent centering is not used by the release")
-    return x_bb, noise.local_latents * emit_lat[:, None]
+    return State(_bb_ca_noise(batch, noise.bb_ca, noise.group_offsets, bb_ca), noise.local_latents * emit_lat[:, None])
+
+
+def corrupt(
+    batch: Batch, clean: State, t: Float[Array, " 2"], noise: Noise, noise_config: tuple[NoiseConfig, NoiseConfig]
+) -> State:
+    """The forward process `(1 - t) x_0 + t x_1` at per-modality times `t`, with `x_0 = initial_state(...)`."""
+    x0 = initial_state(batch, noise, *noise_config)
+    emit_bb, emit_lat = flow_emit_masks(batch)
+    return State(
+        (1.0 - t[0]) * x0.bb_ca + t[0] * clean.bb_ca * emit_bb[:, None],
+        (1.0 - t[1]) * x0.local_latents + t[1] * clean.local_latents * emit_lat[:, None],
+    )
 
 
 # --------------------------------------------------------------------------- integration
@@ -190,28 +332,68 @@ def _step(cfg: ModalityConfig, x, v, t, t_next, g, stochastic, eps, emit):
     return (x + dx) * emit[:, None]
 
 
-class _Schedule(eqx.Module):
-    t: Float[Array, "S 2"]
-    t_next: Float[Array, "S 2"]
-    g: Float[Array, "S 2"]
-    stochastic: Bool[Array, "S 2"]
-
-
-def _schedule(config: SamplingConfig) -> _Schedule:
-    ts, gs, stoch = [], [], []
-    for cfg in (config.bb_ca, config.local_latents):
-        t = time_schedule(cfg, config.nsteps)
-        ts.append(t)
-        gs.append(noise_schedule(cfg, t[:-1]))
-        stoch.append((t[:-1] <= cfg.t_lim_ode) & (t[:-1] >= cfg.t_lim_ode_below) & (cfg.sampling_mode == "vf_tsr"))
-    t = np.stack(ts, -1)
-    return _Schedule(t=t[:-1], t_next=t[1:], g=np.stack(gs, -1), stochastic=np.stack(stoch, -1))
-
-
 class Trajectory(eqx.Module):
-    x_bb_ca: Float[Array, "N 3"]
-    x_local_latents: Float[Array, "N L"]
-    last: FlowOutput  # network output at the final step
+    final: State
+    clean: State  # the network's clean prediction (x_1) at the last step
+    last: FlowOutput  # network output at the last step
+
+    def at_clean_prediction(self) -> Trajectory:
+        """This trajectory with its final state replaced by the last clean prediction (for decoding it)."""
+        return Trajectory(self.clean, self.clean, self.last)
+
+
+@eqx.filter_jit
+def simulate(
+    model: LocalLatentsTransformer,
+    batch: Batch,
+    state: State,
+    schedule: Schedule,
+    steps: StepNoise,
+    config: SamplingConfig,
+    noise_config: tuple[NoiseConfig, NoiseConfig],
+    fixed_bb_ca: Float[Array, "N 3"] | None = None,
+) -> Trajectory:
+    """Integrate `state` through every step of `schedule` with the given draws (deterministic).
+
+    With `fixed_bb_ca` (nm) only the latents are generated (the reference's `resampled_forward_marginal`
+    inverse folding): before each step the CA state is redrawn from its forward marginal around
+    `fixed_bb_ca`, and it is set to `fixed_bb_ca` at t=1.
+    """
+    if len(schedule) == 0:
+        raise ValueError("empty schedule")
+    emit_bb, emit_lat = flow_emit_masks(batch)
+    x = (state.bb_ca, state.local_latents)
+    last = clean = None
+    start = 0
+    for width, depth in schedule.bands:
+        band = slice(start, start + width)
+        xs = (
+            (schedule.t[band], schedule.t_next[band], schedule.g[band], schedule.stochastic[band]),
+            jax.tree.map(lambda a, band=band: a[band], steps),
+        )
+
+        def body(x, step, depth=depth):
+            (t, t_next, g, stochastic), eps = step
+            x_bb, x_lat = x
+            if fixed_bb_ca is not None:
+                x0 = _bb_ca_noise(batch, eps.marginal_bb_ca, eps.marginal_offsets, noise_config[0])
+                x_bb = (1.0 - t[0]) * x0 + t[0] * fixed_bb_ca * emit_bb[:, None]
+            out = model(batch, FlowInputs(x_bb, x_lat, t[0], t[1], eps.coord_group_priority), depth)
+            clean = (
+                (x_bb + (1.0 - t[0]) * out.v_bb_ca) * emit_bb[:, None],
+                (x_lat + (1.0 - t[1]) * out.v_local_latents) * emit_lat[:, None],
+            )
+            x_bb = _step(config.bb_ca, x_bb, out.v_bb_ca, t[0], t_next[0], g[0], stochastic[0], eps.bb_ca, emit_bb)
+            x_lat = _step(config.local_latents, x_lat, out.v_local_latents, t[1], t_next[1], g[1], stochastic[1],
+                          eps.local_latents, emit_lat)
+            if fixed_bb_ca is not None:
+                x_bb = jnp.where(t_next[0] >= 1.0, fixed_bb_ca * emit_bb[:, None], x_bb)
+            return (x_bb, x_lat), (out, clean)
+
+        x, (outs, cleans) = jax.lax.scan(body, x, xs)
+        last, clean = jax.tree.map(lambda a: a[-1], (outs, cleans))
+        start += width
+    return Trajectory(State(*x), State(*clean), last)
 
 
 @eqx.filter_jit
@@ -222,36 +404,9 @@ def integrate(
     config: SamplingConfig,
     noise_config: tuple[NoiseConfig, NoiseConfig],
 ) -> Trajectory:
-    """Run the sampler from given draws (deterministic)."""
-    widths = [w for w, _ in config.recycle_schedule]
-    if sum(widths) != config.nsteps:
-        raise ValueError(f"recycle schedule covers {sum(widths)} steps, expected {config.nsteps}")
-    emit_bb, emit_lat = flow_emit_masks(batch)
-    sched = _schedule(config)
-    x = initial_state(batch, noise, *noise_config)
-    last = None
-    start = 0
-    for width, depth in config.recycle_schedule:
-        band = slice(start, start + width)
-        xs = (
-            jax.tree.map(lambda a, band=band: a[band], sched),
-            noise.steps_bb_ca[band], noise.steps_local_latents[band], noise.coord_group_priority[band],
-        )
-
-        def body(x, step, depth=depth):
-            s, eps_bb, eps_lat, priority = step
-            inputs = FlowInputs(x[0], x[1], s.t[0], s.t[1], priority)
-            out = model(batch, inputs, depth)
-            x_bb = _step(config.bb_ca, x[0], out.v_bb_ca, s.t[0], s.t_next[0], s.g[0], s.stochastic[0], eps_bb,
-                         emit_bb)
-            x_lat = _step(config.local_latents, x[1], out.v_local_latents, s.t[1], s.t_next[1], s.g[1],
-                          s.stochastic[1], eps_lat, emit_lat)
-            return (x_bb, x_lat), out
-
-        x, outs = jax.lax.scan(body, x, xs)
-        last = jax.tree.map(lambda a: a[-1], outs)
-        start += width
-    return Trajectory(x[0], x[1], last)
+    """Run the full sampler from given draws (deterministic)."""
+    state = initial_state(batch, noise, *noise_config)
+    return simulate(model, batch, state, schedule(config), noise.steps, config, noise_config)
 
 
 class Design(eqx.Module):
@@ -271,11 +426,10 @@ def decode(decoder: DecoderTransformer, batch: Batch, trajectory: Trajectory, co
         _, emit = ae_masks(batch)
         fill = emit & (batch.cond_sequence == C.MASK_RESIDUE)
         batch = eqx.tree_at(lambda b: b.cond_sequence, batch, jnp.where(fill, predicted, batch.cond_sequence))
-    out = decoder(
-        batch, DecoderInputs(trajectory.x_bb_ca, trajectory.x_local_latents), required_atom_mask=batch.coord_group >= 0
-    )
+    final = trajectory.final
+    out = decoder(batch, DecoderInputs(final.bb_ca, final.local_latents), required_atom_mask=batch.coord_group >= 0)
     no_latent = ~out.emit_mask & batch.padding_mask
-    coords = out.coords_nm.at[:, 1].set(jnp.where(no_latent[:, None], trajectory.x_bb_ca, out.coords_nm[:, 1]))
+    coords = out.coords_nm.at[:, 1].set(jnp.where(no_latent[:, None], final.bb_ca, out.coords_nm[:, 1]))
     return Design(
         coords=coords * 10.0,
         atom_mask=out.atom_mask.at[:, 1].set(out.atom_mask[:, 1] | no_latent),
@@ -293,9 +447,46 @@ class RFD4Proteina(eqx.Module):
     noise_local_latents: NoiseConfig = eqx.field(static=True)
     latent_dim: int = eqx.field(static=True)
 
+    @property
+    def noise_config(self) -> tuple[NoiseConfig, NoiseConfig]:
+        return self.noise_bb_ca, self.noise_local_latents
+
 
 def sample(model: RFD4Proteina, batch: Batch, config: SamplingConfig, *, key: PRNGKeyArray) -> Design:
     """Generate one design for `batch`."""
     noise = draw_noise(key, batch, nsteps=config.nsteps, latent_dim=model.latent_dim)
-    trajectory = integrate(model.flow, batch, noise, config, (model.noise_bb_ca, model.noise_local_latents))
+    trajectory = integrate(model.flow, batch, noise, config, model.noise_config)
+    return decode(model.decoder, batch, trajectory, config)
+
+
+def partial_diffuse(
+    model: RFD4Proteina,
+    batch: Batch,
+    config: SamplingConfig,
+    clean: State,
+    *,
+    key: PRNGKeyArray,
+    fraction: float | None = None,
+    t_bb_ca: float | None = None,
+    t_local_latents: float | None = None,
+) -> Design:
+    """Re-noise `clean` (e.g. `design.trajectory.final`) to the start of a `partial_schedule` and regenerate.
+
+    Clean latents of an arbitrary structure need the AE encoder, which is not ported.
+    """
+    sched, start = partial_schedule(config, fraction=fraction, t_bb_ca=t_bb_ca, t_local_latents=t_local_latents)
+    noise = draw_noise(key, batch, nsteps=len(sched), latent_dim=model.latent_dim)
+    state = corrupt(batch, clean, start, noise, model.noise_config)
+    trajectory = simulate(model.flow, batch, state, sched, noise.steps, config, model.noise_config)
+    return decode(model.decoder, batch, trajectory, config)
+
+
+def inverse_fold(
+    model: RFD4Proteina, batch: Batch, config: SamplingConfig, ca: Float[Array, "N 3"], *, key: PRNGKeyArray
+) -> Design:
+    """Generate latents (hence sequence and side chains) for the fixed CA trace `ca` (Å)."""
+    noise = draw_noise(key, batch, nsteps=config.nsteps, latent_dim=model.latent_dim)
+    state = initial_state(batch, noise, *model.noise_config)
+    trajectory = simulate(model.flow, batch, state, schedule(config), noise.steps, config, model.noise_config,
+                          fixed_bb_ca=jnp.asarray(ca) / 10.0)
     return decode(model.decoder, batch, trajectory, config)

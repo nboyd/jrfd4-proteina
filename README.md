@@ -28,7 +28,7 @@ from jrfd4_proteina.sampling import release_sampling_config, sample
 model = convert.load("nvidia/RFD4-Proteina")      # converts the released bundle (needs the convert extra)
 io.save(model, "rfd4_proteina")                   # later: io.load("rfd4_proteina"), torch-free
 
-batch = convert.featurize("design.yaml")[0]       # any RFD4 condition spec / annotated CIF
+batch = convert.featurize(spec)[0]                # an RFD4 condition spec as a dict, {example_id: spec}
 design = sample(model, batch, release_sampling_config(), key=jax.random.key(0))
 design.coords, design.atom_mask, design.residue_type  # Å, [N, 37]; unified 147-class vocabulary
 ```
@@ -48,6 +48,11 @@ designs = eqx.filter_jit(eqx.filter_vmap(lambda m, b, k: sample(m, b, config, ke
 |---|---|
 | `sample(model, batch, config, *, key) -> Design` | draw noise, integrate, decode |
 | `integrate(flow, batch, noise, config, noise_config) -> Trajectory` | deterministic sampler given `Noise` (reverse-mode differentiable) |
+| `simulate(flow, batch, state, schedule, steps, config, noise_config, fixed_bb_ca=None) -> Trajectory` | integrate a `State` through any slice of a `Schedule` |
+| `schedule(config)` / `partial_schedule(config, *, fraction \| t_bb_ca, t_local_latents)` | per-step times, noise scales and recycle depths; slice with `[a:b]` |
+| `partial_diffuse(model, batch, config, clean, *, key, ...)` / `corrupt(...)` | partial diffusion from a clean `State` (e.g. `design.trajectory.final`) |
+| `inverse_fold(model, batch, config, ca, *, key)` | generate latents/sequence for a fixed CA trace (Å) |
+| `search.beam_search(model, batch, config, checkpoints, *, key, ...)` | reward-guided beam search |
 | `decode(decoder, batch, trajectory, config) -> Design` | AE decode, conditioned on the predicted sequence |
 | `LocalLatentsTransformer.__call__(batch, FlowInputs, n_recycle) -> FlowOutput` | one network evaluation (velocities, sequence and insertion logits) |
 | `DecoderTransformer.__call__(batch, DecoderInputs, required_atom_mask=None) -> DecoderOutput` | |
@@ -55,6 +60,53 @@ designs = eqx.filter_jit(eqx.filter_vmap(lambda m, b, k: sample(m, b, config, ke
 | `Batch` | typed design inputs; `Batch.from_reference` adapts the reference collated batch |
 | `convert.load / convert_model / featurize / batch_from_reference` | torch-dependent conversion |
 | `io.save / io.load` | torch-free serialization |
+
+### Example: PD-L1 binder
+
+The reference's ["design a binder in 10 lines"](https://github.com/RosettaCommons/RFD4-Proteina/blob/main/docs/how-to/binder-in-10-lines.md)
+spec (also `tests/data/pdl1_binder.yaml`): a 50-120 residue binder against PD-L1 given the target's backbone
+geometry, sequence and three hotspots.
+
+```python
+spec = {"pdl1_binder": {
+    "input": "tests/data/5o45_cropped.cif.zst",   # relative to the working directory
+    "contig": "50-120, /0, A17-131",
+    "conditions": {
+        "C_CRDGRP": {1: [{"select": "sel('A/*/*/[N,CA,C,O]')"}]},
+        "C_SEQ": {True: [{"select": "sel('A')"}]},
+        "C_HOT": {True: [{"select": s} for s in ("sel('A/*/56/[CG,OH]')", "sel('A/*/115/[CG,SD]')",
+                                                  "sel('A/*/123/[CD2,OH]')")]},
+    },
+}}
+batch = convert.featurize(spec, seed=0)[0]       # the binder length is sampled from the contig; seed fixes it
+design = sample(model, batch, release_sampling_config(), key=jax.random.key(0))
+```
+
+A `Batch` holds one sampled layout (one binder length): featurize again, with other seeds or fixed lengths
+(`"contig": "80, /0, A17-131"`), to cover a range. Featurizing takes ~0.3 s after the first call.
+
+### Beam search
+
+At each checkpoint every survivor branches `n_branch` times, the branches are integrated to the checkpoint with
+fresh noise and scored (rolled out to t=1 and decoded, or with `use_clean_prediction` decoded from their last
+clean prediction), and the best `beam_width` continue. Rewards are maximized and run inside a jitted map over
+candidates: write them as `eqx.Module`s holding their models as fields, so they are passed, not closed over.
+
+```python
+from jrfd4_proteina.search import Checkpoint, beam_search
+
+class Compact(eqx.Module):                        # any JAX reward: (design, *, key) -> reward | (reward, aux)
+    def __call__(self, design, *, key):
+        ca, m = design.coords[:, 1], design.atom_mask[:, 1]
+        center = (ca * m[:, None]).sum(0) / m.sum()
+        return -jnp.sqrt((((ca - center) ** 2).sum(-1) * m).sum() / m.sum())
+
+result = beam_search(model, batch, config, [Checkpoint(20, Compact()), Checkpoint(40, Compact()),
+                                            Checkpoint(60, Compact())], key=jax.random.key(0), beam_width=4, n_branch=4)
+result.designs, result.rewards                    # final beam [4], best first; result.checkpoints: every candidate
+```
+
+Search steps the sampler one step at a time (one compile per recycle depth), so checkpoints can sit anywhere.
 
 Each recycle band of the schedule is one `lax.scan` with a static trunk depth; within a step, early recycles run
 under `stop_gradient` (as in the reference) and the final one is differentiated.
@@ -70,9 +122,15 @@ under `stop_gradient` (as in the reference) and the final one is differentiated.
   `vf` ODE; zero-COM initial noise with per-molecule stochastic centering; banded recycle depths.
 * AE decoder (`DecoderTransformer`) and sequence-conditioned decoding.
 
-Not ported: training, the AE encoder, partial diffusion, inverse folding, classifier-free guidance (unused by
-the release checkpoint), reward-guided/beam search, metrics. Featurization is delegated to the reference
-pipeline (`convert.featurize`, needs torch); a torch-free featurizer is not included.
+* Partial diffusion (`partial_trajectory_fraction_steps`, explicit and coupled `partial_t_*`), inverse folding
+  (`resampled_forward_marginal`) and beam search (`BeamSearchStrategy`: per-checkpoint rewards and branching,
+  rollout or clean-prediction scoring, continuation criteria, resuming from saved states).
+
+Not ported: training, the AE encoder (so partial diffusion starts from latents this model produced, not from an
+arbitrary structure), classifier-free guidance (unused by the release checkpoint), differentiable-metric
+guidance, metrics and refolding oracles. Featurization is delegated to the reference
+pipeline (`convert.featurize`, needs torch; condition specs only, not condition-annotated CIFs); a torch-free
+featurizer is not included.
 
 ## Parity with the PyTorch reference
 

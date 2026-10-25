@@ -1,13 +1,12 @@
 """Torch-free tests (run by default)."""
 
-import dataclasses
 import subprocess
 import sys
 
 import numpy as np
 import pytest
 
-from jrfd4_proteina.sampling import _schedule, noise_schedule, release_sampling_config, time_schedule
+from jrfd4_proteina.sampling import noise_schedule, release_sampling_config, schedule, time_schedule
 
 
 def test_import_does_not_pull_in_torch():
@@ -35,7 +34,7 @@ def test_tail_schedule_rejects_too_few_steps():
 
 
 def test_stochastic_band_excludes_both_ends():
-    s = _schedule(dataclasses.replace(release_sampling_config()))
+    s = schedule(release_sampling_config())
     t, stochastic = np.asarray(s.t), np.asarray(s.stochastic)
     assert not stochastic[t > 0.95].any()
     assert not stochastic[t < 0.02].any()
