@@ -21,13 +21,8 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from jrfd4_proteina import constants as C
 from jrfd4_proteina.batch import Batch
 from jrfd4_proteina.features import DecoderInputs, FlowInputs
-from jrfd4_proteina.model import (
-    DecoderTransformer,
-    FlowOutput,
-    LocalLatentsTransformer,
-    ae_masks,
-    flow_emit_masks,
-)
+from jrfd4_proteina.layers import matmul_dtype
+from jrfd4_proteina.model import DecoderTransformer, FlowOutput, LocalLatentsTransformer
 
 
 @dataclass(frozen=True)
@@ -283,7 +278,7 @@ class State(eqx.Module):
 
 def _bb_ca_noise(batch: Batch, eps: Float[Array, "N 3"], offsets: Float[Array, "G 3"], cfg: NoiseConfig):
     """x_0 for the CA modality: masked, optionally zero-COM, plus a stochastic offset per centering group."""
-    emit_bb, _ = flow_emit_masks(batch)
+    emit_bb = batch.design_mask
     x_bb = eps * emit_bb[:, None]
     if cfg.zero_com:
         x_bb = (x_bb - masked_mean(x_bb, emit_bb)) * emit_bb[:, None]
@@ -298,7 +293,7 @@ def _bb_ca_noise(batch: Batch, eps: Float[Array, "N 3"], offsets: Float[Array, "
 
 
 def initial_state(batch: Batch, noise: Noise, bb_ca: NoiseConfig, local_latents: NoiseConfig) -> State:
-    _, emit_lat = flow_emit_masks(batch)
+    emit_lat = batch.latent_mask
     if local_latents.zero_com or local_latents.centering_scale is not None:
         raise NotImplementedError("latent centering is not used by the release")
     return State(_bb_ca_noise(batch, noise.bb_ca, noise.group_offsets, bb_ca), noise.local_latents * emit_lat[:, None])
@@ -309,7 +304,7 @@ def corrupt(
 ) -> State:
     """The forward process `(1 - t) x_0 + t x_1` at per-modality times `t`, with `x_0 = initial_state(...)`."""
     x0 = initial_state(batch, noise, *noise_config)
-    emit_bb, emit_lat = flow_emit_masks(batch)
+    emit_bb, emit_lat = batch.design_mask, batch.latent_mask
     return State(
         (1.0 - t[0]) * x0.bb_ca + t[0] * clean.bb_ca * emit_bb[:, None],
         (1.0 - t[1]) * x0.local_latents + t[1] * clean.local_latents * emit_lat[:, None],
@@ -361,7 +356,7 @@ def simulate(
     """
     if len(schedule) == 0:
         raise ValueError("empty schedule")
-    emit_bb, emit_lat = flow_emit_masks(batch)
+    emit_bb, emit_lat = batch.design_mask, batch.latent_mask
     x = (state.bb_ca, state.local_latents)
     last = clean = None
     start = 0
@@ -423,8 +418,7 @@ def decode(decoder: DecoderTransformer, batch: Batch, trajectory: Trajectory, co
         logits = trajectory.last.sequence_logits
         allowed = decoder.allowed_residue_types[batch.token_type]
         predicted = jnp.argmax(jnp.where(allowed, logits, jnp.finfo(logits.dtype).min), -1)
-        _, emit = ae_masks(batch)
-        fill = emit & (batch.cond_sequence == C.MASK_RESIDUE)
+        fill = batch.latent_mask & (batch.cond_sequence == C.MASK_RESIDUE)
         batch = eqx.tree_at(lambda b: b.cond_sequence, batch, jnp.where(fill, predicted, batch.cond_sequence))
     final = trajectory.final
     out = decoder(batch, DecoderInputs(final.bb_ca, final.local_latents), required_atom_mask=batch.coord_group >= 0)
@@ -450,6 +444,15 @@ class RFD4Proteina(eqx.Module):
     @property
     def noise_config(self) -> tuple[NoiseConfig, NoiseConfig]:
         return self.noise_bb_ca, self.noise_local_latents
+
+    def bfloat16(self) -> RFD4Proteina:
+        """A copy with bf16 mixed precision in the flow trunk and conditioning (see `layers`). Unlike torch's
+        `.bfloat16()` this is not a blanket cast: norms and residual streams compute in float32, and the flow's output
+        heads and the decoder keep float32 weights, so the integrator only sees float32 velocities."""
+        heads = lambda f: (f.ca_linear, f.local_latents_linear, f.sequence_readout, f.insertion_q_proj,
+                           f.insertion_k_proj)
+        flow = eqx.tree_at(heads, matmul_dtype(self.flow, jnp.bfloat16), heads(self.flow))
+        return eqx.tree_at(lambda m: m.flow, self, flow)
 
 
 def sample(model: RFD4Proteina, batch: Batch, config: SamplingConfig, *, key: PRNGKeyArray) -> Design:

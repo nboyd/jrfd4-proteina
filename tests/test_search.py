@@ -10,7 +10,7 @@ import pytest
 
 from jrfd4_proteina import constants as C
 from jrfd4_proteina.batch import Batch
-from jrfd4_proteina.model import DecoderOutput, FlowOutput, ae_masks
+from jrfd4_proteina.model import DecoderOutput, FlowOutput
 from jrfd4_proteina.sampling import (
     NoiseConfig,
     RFD4Proteina,
@@ -68,7 +68,7 @@ class ToyDecoder(eqx.Module):
     allowed_residue_types: jax.Array
 
     def __call__(self, batch, inputs, required_atom_mask=None):
-        _, emit = ae_masks(batch)
+        emit = batch.latent_mask
         coords = jnp.broadcast_to(inputs.ca_coors_nm[:, None], (N, 37, 3)) * emit[:, None, None]
         atom_mask = (jnp.arange(37) == 1)[None] & emit[:, None]
         return DecoderOutput(coords, (batch.cond_sequence * emit).astype(jnp.int32), atom_mask, emit,

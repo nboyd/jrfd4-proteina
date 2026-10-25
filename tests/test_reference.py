@@ -251,6 +251,33 @@ def test_save_load_round_trip_is_torch_free(reference, tmp_path):
     assert n_params == sum(x.size for x in jax.tree.leaves(model) if hasattr(x, "size"))
 
 
+
+def test_bfloat16_casts_only_the_flow_trunk(reference):
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+
+    from jrfd4_proteina.layers import Linear
+
+    def dtypes(tree):  # of the floating-point parameters
+        return {x.dtype for x in jax.tree.leaves(eqx.filter(tree, eqx.is_inexact_array))}
+
+    f32, bf16 = np.dtype(jnp.float32), np.dtype(jnp.bfloat16)
+
+    def is_linear(x):
+        return isinstance(x, Linear)
+
+    _, model, _, _ = reference
+    mixed = model.bfloat16()
+    assert dtypes(model) == {f32}  # the original is untouched
+    trunk_linears = [x for x in jax.tree.leaves(mixed.flow.trunk, is_leaf=is_linear) if is_linear(x)]
+    assert {x.weight.dtype for x in trunk_linears} == {bf16}
+    for kept in (mixed.flow.ca_linear, mixed.flow.local_latents_linear, mixed.flow.sequence_readout,
+                 mixed.flow.insertion_q_proj, mixed.flow.insertion_k_proj, mixed.decoder):
+        assert dtypes(kept) == {f32}
+    outside_linears = jax.tree.map(lambda x: None if is_linear(x) else x, mixed.flow, is_leaf=is_linear)
+    assert dtypes(outside_linears) == {f32}  # norms, embeddings and other non-Linear parameters
+
 def _flow_matcher():
     from rfproteina.flow_matching.product_space_flow_matcher import ProductSpaceFlowMatcher
 

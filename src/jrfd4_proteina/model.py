@@ -35,39 +35,34 @@ class Trunk(eqx.Module):
     first layer (the reference updates pairs after layers `i % every == 0`, `i < nlayers - 1`).
     """
 
-    attn: AttnAndTransition  # arrays stacked as [n_blocks, every, ...]
-    attn_static: AttnAndTransition = eqx.field(static=True)
-    pair: PairReprUpdate | None  # arrays stacked as [n_blocks, ...]
-    pair_static: PairReprUpdate | None = eqx.field(static=True)
+    attn: AttnAndTransition  # leaves stacked as [n_blocks, every, ...]
+    pair: PairReprUpdate | None  # leaves stacked as [n_blocks, ...]
     every: int = eqx.field(static=True)
 
     @classmethod
     def from_torch(cls, attn_layers, pair_layers, every: int) -> Trunk:
-        attn = [from_torch(layer) for layer in attn_layers]
-        n_blocks = len(attn) // every
-        stacked, attn_static = stack_modules(attn)
-        stacked = jax.tree.map(lambda x: x.reshape((n_blocks, every) + x.shape[1:]), stacked)
+        n_layers = len(attn_layers)
+        attn = stack_modules([from_torch(layer) for layer in attn_layers])
+        attn = jax.tree.map(lambda x: x.reshape((n_layers // every, every) + x.shape[1:]), attn)
         if pair_layers is None:
-            return cls(stacked, attn_static, None, None, every)
-        expected = [i for i in range(len(attn) - 1) if i % every == 0]
+            return cls(attn, None, every)
+        expected = [i for i in range(n_layers - 1) if i % every == 0]
         present = [i for i, layer in enumerate(pair_layers) if layer is not None]
-        if len(attn) % every or present != expected or expected != list(range(0, len(attn), every)):
+        if n_layers % every or present != expected or expected != list(range(0, n_layers, every)):
             raise NotImplementedError("pair updates must fall on the first layer of equal-size blocks")
-        pair, pair_static = stack_modules([from_torch(pair_layers[i]) for i in present])
-        return cls(stacked, attn_static, pair, pair_static, every)
+        return cls(attn, stack_modules([from_torch(pair_layers[i]) for i in present]), every)
 
     def __call__(
         self, s: Float[Array, "N D"], z: Float[Array, "N N P"] | None, c: Float[Array, "N C"], mask: Bool[Array, " N"]
     ) -> tuple[Float[Array, "N D"], Float[Array, "N N P"] | None]:
         @jax.checkpoint
-        def block(carry, params):
+        def block(carry, layers):
             s, z = carry
-            attn_params, pair_params = params
+            attn, pair = layers
             for i in range(self.every):
-                layer = eqx.combine(jax.tree.map(lambda x, i=i: x[i], attn_params), self.attn_static)
-                s = layer(s, z, c, mask)
-                if i == 0 and pair_params is not None:
-                    z = eqx.combine(pair_params, self.pair_static)(s, z, mask)
+                s = jax.tree.map(lambda x, i=i: x[i], attn)(s, z, c, mask)
+                if i == 0 and pair is not None:
+                    z = pair(s, z, mask)
             return (s, z), None
 
         (s, z), _ = jax.lax.scan(block, (s, z), (self.attn, self.pair))
@@ -116,12 +111,6 @@ class FlowOutput(eqx.Module):
     v_local_latents: Float[Array, "N L"]
     sequence_logits: Float[Array, "N V"]
     insertion_logits: Float[Array, "N N"]
-
-
-def flow_emit_masks(batch: Batch) -> tuple[Bool[Array, " N"], Bool[Array, " N"]]:
-    """Tokens that carry each flow modality: (bb_ca, local_latents)."""
-    bb_ca = batch.padding_mask & ~batch.is_in_context_conditioning
-    return bb_ca, bb_ca & batch.supports_local_latent
 
 
 @register_from_torch("rfproteina.nn.local_latents_transformer.LocalLatentsTransformer")
@@ -177,8 +166,8 @@ class LocalLatentsTransformer(eqx.Module):
         """Run `n_recycle` trunk passes (at least one); gradients flow through the last pass only."""
         mask = batch.padding_mask
         c_first = self.conditioning(batch, inputs)
-        s_init = self.init_repr_factory(batch, inputs) * mask[:, None]
-        z_init = self.pair_repr_builder(batch, inputs)
+        s_init = self.init_repr_factory(batch, inputs).astype(jnp.float32) * mask[:, None]  # f32 residual streams
+        z_init = self.pair_repr_builder(batch, inputs).astype(jnp.float32)
         n_recycle = max(1, n_recycle)
         condition_remaining = self.recycle_dim is not None and n_recycle > 1
 
@@ -199,7 +188,7 @@ class LocalLatentsTransformer(eqx.Module):
         )
         s, _ = trunk_pass(jnp.array(n_recycle - 1), s, z)
 
-        emit_bb_ca, emit_latents = flow_emit_masks(batch)
+        emit_bb_ca, emit_latents = batch.design_mask, batch.latent_mask
         s_detached = jax.lax.stop_gradient(s)
         q, k = self.insertion_q_proj(s_detached), self.insertion_k_proj(s_detached)
         return FlowOutput(
@@ -216,12 +205,6 @@ class DecoderOutput(eqx.Module):
     atom_mask: Bool[Array, "N 37"]
     emit_mask: Bool[Array, " N"]
     seq_logits: Float[Array, "N V"]
-
-
-def ae_masks(batch: Batch) -> tuple[Bool[Array, " N"], Bool[Array, " N"]]:
-    """The decoder's (attention, emit) token masks."""
-    attention = batch.padding_mask & ~batch.is_in_context_conditioning
-    return attention, attention & batch.supports_local_latent
 
 
 @register_from_torch("rfproteina.partial_autoencoder.decoder.DecoderTransformer")
@@ -260,7 +243,7 @@ class DecoderTransformer(eqx.Module):
         self, batch: Batch, inputs: DecoderInputs, required_atom_mask: Bool[Array, "N 37"] | None = None
     ) -> DecoderOutput:
         """Decode, keeping conditioned residue types; `required_atom_mask` forces atom slots on."""
-        attention, emit = ae_masks(batch)
+        attention, emit = batch.design_mask, batch.latent_mask
         c = self.cond_factory(batch, inputs)
         c = self.transition_c_2(self.transition_c_1(c, attention), attention)
         s = self.init_repr_factory(batch, inputs) * attention[:, None]

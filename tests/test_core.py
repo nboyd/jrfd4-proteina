@@ -39,3 +39,25 @@ def test_stochastic_band_excludes_both_ends():
     assert not stochastic[t > 0.95].any()
     assert not stochastic[t < 0.02].any()
     assert stochastic.any()
+
+
+def test_matmul_precision_follows_the_weights():
+    import jax
+    import jax.numpy as jnp
+
+    from jrfd4_proteina.layers import LayerNorm, Linear, TriangleMultiplication, matmul_dtype
+
+    k = iter(jax.random.split(jax.random.key(0), 16))
+    lin = lambda i, o: Linear(jax.random.normal(next(k), (o, i)) / i**0.5, jnp.zeros(o))
+    ln = LayerNorm(jnp.ones(8), jnp.zeros(8))
+    tri = TriangleMultiplication(ln, ln, *(lin(8, 8) for _ in range(6)), outgoing=True)
+    z = jax.random.normal(next(k), (5, 5, 8))
+    mask = jnp.ones((5, 5), bool)
+
+    assert lin(8, 4)(z).dtype == jnp.float32
+    mixed = matmul_dtype(tri, jnp.bfloat16)
+    assert mixed.linear_z.weight.dtype == jnp.bfloat16 and mixed.layer_norm_in.weight.dtype == jnp.float32
+    assert mixed.linear_z(z).dtype == jnp.bfloat16  # matmul outputs follow the weights...
+    assert mixed.layer_norm_in(z.astype(jnp.bfloat16)).dtype == jnp.float32  # ...norms compute in float32
+    full, half = tri(z, mask), mixed(z, mask)
+    assert float(jnp.abs(half.astype(jnp.float32) - full).max() / jnp.abs(full).max()) < 0.05

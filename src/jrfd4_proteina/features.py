@@ -16,7 +16,7 @@ import numpy as np
 from jaxtyping import Array, Bool, Float
 
 from jrfd4_proteina import constants as C
-from jrfd4_proteina.backend import from_torch, register_from_torch
+from jrfd4_proteina.backend import REGISTRY, from_torch
 from jrfd4_proteina.batch import Batch
 from jrfd4_proteina.layers import Embedding, Linear, Norm
 
@@ -449,16 +449,16 @@ def _convert_feature(m) -> eqx.Module:
     raise NotImplementedError(f"feature {kind} is not ported")
 
 
-@register_from_torch(f"{_FF}.FeatureFactory")
 def _convert_factory(m) -> FeatureFactory | ZeroFeatures:
     if m.ret_zero:
         return ZeroFeatures(dim=m.zero_creator.dim)
-    ln_out = None if type(m.ln_out).__name__ == "Identity" else from_torch(m.ln_out)
-    mode = "example" if m.compact else m.mode
     return FeatureFactory(
         features=tuple(_convert_feature(f) for f in m.feat_creators),
         linear_out=from_torch(m.linear_out),
-        ln_out=ln_out,
-        mode=mode,
+        ln_out=from_torch(m.ln_out),
+        mode="example" if m.compact else m.mode,
     )
+
+
+REGISTRY.append((f"{_FF}.FeatureFactory", _convert_factory))
 

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import os
 import random
 from collections.abc import Iterator, Mapping
@@ -21,9 +22,19 @@ import torch
 import jrfd4_proteina.features
 import jrfd4_proteina.layers
 import jrfd4_proteina.model  # noqa: F401
-from jrfd4_proteina.backend import from_torch
+from jrfd4_proteina.backend import REGISTRY, from_torch
 from jrfd4_proteina.batch import Batch
 from jrfd4_proteina.sampling import NoiseConfig, RFD4Proteina
+
+
+def _resolve(path: str) -> type:
+    module, _, name = path.rpartition(".")
+    return getattr(importlib.import_module(module), name)
+
+
+for _path, _convert in REGISTRY:
+    from_torch.register(_resolve(_path), _convert)
+from_torch.register(torch.nn.Identity, lambda m: None)
 
 
 @from_torch.register(torch.Tensor)

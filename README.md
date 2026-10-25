@@ -42,6 +42,30 @@ designs = eqx.filter_jit(eqx.filter_vmap(lambda m, b, k: sample(m, b, config, ke
     model, batch, keys)
 ```
 
+### Precision and speed
+
+`model.bfloat16()` returns a copy that runs the flow trunk in bf16 mixed precision, as the reference's `bf16-mixed`
+default does: matmuls take bf16 inputs and accumulate in float32, norms and softmax statistics run in float32, residual
+streams stay float32, and the flow's output heads and the decoder are untouched, so the integrator only sees float32
+velocities. Precision follows the weights' dtype, so the float32 model is unaffected.
+
+```python
+fast = model.bfloat16()  # ~1.6x faster batched sampling
+```
+
+Per-design sampling time, PD-L1 with a 60-residue binder (175 tokens), one H100, steady state:
+
+| | batch 1 | batch 16 |
+|---|---|---|
+| this port, `model.bfloat16()` | 1.7 s | 1.2 s |
+| this port, float32 (TF32 matmuls, the JAX default) | 2.3 s | 1.9 s |
+| reference `rfd4-generate` defaults (`bf16-mixed`, `torch.compile`; includes featurization and I/O, pads to 192 tokens) | 3.8 s | 1.0-1.1 s |
+| reference float32 eager (TF32) | 6.1-6.4 s | 3.3-3.7 s |
+
+bf16 changes single network evaluations by 1-8% (TF32: under 1%), but 256 bf16 PD-L1 designs are statistically
+indistinguishable from the reference's float32 designs (interface, hotspot, geometry and clash metrics: KS p >= 0.42;
+residue types: Jensen-Shannon distance 0.016, chi-squared p 0.76).
+
 ### API
 
 | | |
@@ -56,6 +80,7 @@ designs = eqx.filter_jit(eqx.filter_vmap(lambda m, b, k: sample(m, b, config, ke
 | `decode(decoder, batch, trajectory, config) -> Design` | AE decode, conditioned on the predicted sequence |
 | `LocalLatentsTransformer.__call__(batch, FlowInputs, n_recycle) -> FlowOutput` | one network evaluation (velocities, sequence and insertion logits) |
 | `DecoderTransformer.__call__(batch, DecoderInputs, required_atom_mask=None) -> DecoderOutput` | |
+| `RFD4Proteina.bfloat16() -> RFD4Proteina` | bf16 mixed-precision flow trunk (see above); `layers.matmul_dtype` for any module |
 | `SamplingConfig` / `release_sampling_config()` | schedules, TSR temperature, recycle bands (reference defaults: 60 steps, medium front-loaded recycling) |
 | `Batch` | typed design inputs; `Batch.from_reference` adapts the reference collated batch |
 | `convert.load / convert_model / featurize / batch_from_reference` | torch-dependent conversion |

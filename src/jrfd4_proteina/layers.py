@@ -1,6 +1,11 @@
 """Leaf and trunk layers of the RFD4-Proteina networks, for a single example.
 
 Shapes: N tokens, D token channels, P pair channels, C conditioning channels, H heads.
+
+Precision follows the weights, as under torch autocast: every matmul casts its inputs to its `Linear` weights'
+dtype, accumulates in float32 and returns the weights' dtype, while norms and softmax statistics compute in
+float32 and residual sums promote back to it. So `matmul_dtype(module, jnp.bfloat16)` gives bf16 mixed
+precision, and float32 weights leave the computation unchanged.
 """
 
 from __future__ import annotations
@@ -22,8 +27,17 @@ class Linear(AbstractFromTorch):
     bias: Float[Array, " Out"] | None = None
 
     def __call__(self, x: Float[Array, "... In"]) -> Float[Array, "... Out"]:
-        y = jnp.einsum("...i,oi->...o", x, self.weight)
-        return y if self.bias is None else y + self.bias
+        y = jnp.einsum("...i,oi->...o", x.astype(self.weight.dtype), self.weight, preferred_element_type=jnp.float32)
+        return (y if self.bias is None else y + self.bias).astype(self.weight.dtype)
+
+
+def matmul_dtype(module: eqx.Module, dtype) -> eqx.Module:
+    """`module` with every `Linear` weight cast to `dtype`: its matmuls' input precision (see module docstring)."""
+
+    def cast(leaf):
+        return eqx.tree_at(lambda m: m.weight, leaf, leaf.weight.astype(dtype)) if isinstance(leaf, Linear) else leaf
+
+    return jax.tree.map(cast, module, is_leaf=lambda x: isinstance(x, Linear))
 
 
 @register_from_torch(
@@ -32,9 +46,10 @@ class Linear(AbstractFromTorch):
 class LayerNorm(AbstractFromTorch):
     weight: Float[Array, " D"] | None = None
     bias: Float[Array, " D"] | None = None
-    eps: float = 1e-5
+    eps: float = eqx.field(static=True, default=1e-5)
 
     def __call__(self, x: Float[Array, "... D"]) -> Float[Array, "... D"]:
+        x = x.astype(jnp.float32)
         mean = x.mean(-1, keepdims=True)
         x = (x - mean) * jax.lax.rsqrt(jnp.square(x - mean).mean(-1, keepdims=True) + self.eps)
         if self.weight is not None:
@@ -45,9 +60,10 @@ class LayerNorm(AbstractFromTorch):
 @register_from_torch("torch.nn.modules.normalization.RMSNorm", "rfproteina.nn.modules.norm.CompiledRMSNorm")
 class RMSNorm(AbstractFromTorch):
     weight: Float[Array, " D"] | None = None
-    eps: float = 1e-5
+    eps: float = eqx.field(static=True, default=1e-5)
 
     def __call__(self, x: Float[Array, "... D"]) -> Float[Array, "... D"]:
+        x = x.astype(jnp.float32)
         x = x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
         return x if self.weight is None else x * self.weight
 
@@ -139,7 +155,7 @@ class TransitionADALN(AbstractFromTorch):
 
 
 @register_from_torch("rfproteina.nn.modules.pair_bias_attn.PairBiasAttention")
-class PairBiasAttention(eqx.Module):
+class PairBiasAttention(AbstractFromTorch):
     """Gated multi-head attention with an optional pair bias; padded keys are masked."""
 
     node_norm: Norm
@@ -151,23 +167,6 @@ class PairBiasAttention(eqx.Module):
     pair_norm: Norm | None
     to_bias: Linear | None
     heads: int = eqx.field(static=True)
-
-    @classmethod
-    def from_torch(cls, m):
-        def optional_norm(norm):
-            return None if type(norm).__name__ == "Identity" else from_torch(norm)
-
-        return cls(
-            node_norm=from_torch(m.node_norm),
-            to_qkv=from_torch(m.to_qkv),
-            to_g=from_torch(m.to_g),
-            to_out_node=from_torch(m.to_out_node),
-            q_layer_norm=optional_norm(m.q_layer_norm),
-            k_layer_norm=optional_norm(m.k_layer_norm),
-            pair_norm=None if m.pair_norm is None else from_torch(m.pair_norm),
-            to_bias=None if m.to_bias is None else from_torch(m.to_bias),
-            heads=m.heads,
-        )
 
     def __call__(
         self, x: Float[Array, "N D"], pair: Float[Array, "N N P"] | None, mask: Bool[Array, " N"]
@@ -184,7 +183,8 @@ class PairBiasAttention(eqx.Module):
         pair_mask = mask[:, None] & mask[None, :]
         bias = jnp.where(pair_mask[None], bias, NEG_INF)
         bias = jnp.where(mask[None, :, None], bias, 0.0)  # fully padded query rows attend uniformly
-        o = jax.nn.dot_product_attention(q[None], k[None], v[None], bias=bias[None])[0]
+        dtype = self.to_qkv.weight.dtype
+        o = jax.nn.dot_product_attention(*(t[None].astype(dtype) for t in (q, k, v, bias)))[0].astype(x.dtype)
         return self.to_out_node(einops.rearrange(jax.nn.sigmoid(g) * o, "n h d -> n (h d)"))
 
 
@@ -247,7 +247,8 @@ class TriangleMultiplication(eqx.Module):
         mask = pair_mask[..., None]
         a = self.linear_a_p(z) * jax.nn.sigmoid(self.linear_a_g(z)) * mask
         b = self.linear_b_p(z) * jax.nn.sigmoid(self.linear_b_g(z)) * mask
-        x = jnp.einsum("ikc,jkc->ijc", a, b) if self.outgoing else jnp.einsum("kic,kjc->ijc", a, b)
+        a, b = a.astype(self.linear_z.weight.dtype), b.astype(self.linear_z.weight.dtype)
+        x = jnp.einsum("ikc,jkc->ijc" if self.outgoing else "kic,kjc->ijc", a, b, preferred_element_type=jnp.float32)
         x = self.linear_z(self.layer_norm_out(x))
         return x * jax.nn.sigmoid(self.linear_g(z))
 

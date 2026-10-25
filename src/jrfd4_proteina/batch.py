@@ -64,6 +64,18 @@ class Batch(eqx.Module):
     na_ss_pair: Int[Arr, "N N"]
     na_ss_pair_mask: Bool[Arr, "N N"]
 
+    @property
+    def design_mask(self) -> Bool[Arr, " N"]:
+        """Generated tokens (not padding, not in-context conditioning): they carry CA, and the decoder attends over
+        them. The reference's flow emit mask for `bb_ca` and the AE attention mask."""
+        return self.padding_mask & ~self.is_in_context_conditioning
+
+    @property
+    def latent_mask(self) -> Bool[Arr, " N"]:
+        """Generated tokens with a local latent (and hence decoded atoms): the reference's flow emit mask for
+        `local_latents` and the AE emit mask."""
+        return self.design_mask & self.supports_local_latent
+
     @classmethod
     def from_reference(cls, arrays: Mapping[str, np.ndarray]) -> Batch:
         """Build from one example of the reference collated batch (key names as in `rfproteina`)."""
