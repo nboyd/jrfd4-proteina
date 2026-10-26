@@ -33,6 +33,12 @@ def _sampling_args(mode: str) -> dict:
     return args
 
 
+def _with_mode(modality, mode: str):
+    """Our modality config for the reference `sampling_mode`: `vf_tsr` is the release default, `vf` the plain ODE."""
+    assert mode in ("vf", "vf_tsr")
+    return modality if mode == "vf_tsr" else dataclasses.replace(modality, tsr=None, stochastic=None)
+
+
 def _predict(torch_model):
     def predict(batch, mode, recycle_depth):
         assert mode == "full"
@@ -132,8 +138,8 @@ def _replay(torch_model, torch_batch, batch, model, mode: str, nsteps: int, band
     config = release_sampling_config()
     config = dataclasses.replace(
         config, nsteps=nsteps, recycle_schedule=tuple(map(tuple, bands)),
-        bb_ca=dataclasses.replace(config.bb_ca, sampling_mode=mode),
-        local_latents=dataclasses.replace(config.local_latents, sampling_mode=mode),
+        bb_ca=_with_mode(config.bb_ca, mode),
+        local_latents=_with_mode(config.local_latents, mode),
     )
     stochastic = np.asarray(schedule(config).stochastic)
     emit_bb = np.asarray(batch.padding_mask & ~batch.is_in_context_conditioning & ~batch.coord_cond_mask)
@@ -293,8 +299,8 @@ def _ode_config(nsteps: int, bands):
     config = release_sampling_config()
     return dataclasses.replace(
         config, nsteps=nsteps, recycle_schedule=tuple(map(tuple, bands)),
-        bb_ca=dataclasses.replace(config.bb_ca, sampling_mode="vf"),
-        local_latents=dataclasses.replace(config.local_latents, sampling_mode="vf"),
+        bb_ca=_with_mode(config.bb_ca, "vf"),
+        local_latents=_with_mode(config.local_latents, "vf"),
     )
 
 
@@ -335,7 +341,7 @@ def test_partial_diffusion_parity(reference):
     x, _ = _mid_trajectory_inputs(torch_model, torch_batch)
     ts = {name: torch.from_numpy(np.append(sched.t[:, m], sched.t_next[-1, m])) for m, name in
           enumerate(["bb_ca", "local_latents"])}
-    gt = {name: torch.from_numpy(np.asarray(sched.g[:, m])) for m, name in enumerate(["bb_ca", "local_latents"])}
+    gt = {name: torch.from_numpy(np.array(sched.g[:, m])) for m, name in enumerate(["bb_ca", "local_latents"])}
     args = _sampling_args("vf")
     with torch.no_grad():
         ref, ref_clean, _ = torch_model.fm.partial_simulation(
@@ -370,7 +376,7 @@ def test_inverse_folding_parity_with_replayed_noise(reference):
     target = torch_batch["coords_nm"][:, :, 1, :].float()
     ts = {name: torch.from_numpy(np.append(sched.t[:, m], sched.t_next[-1, m])) for m, name in
           enumerate(["bb_ca", "local_latents"])}
-    gt = {name: torch.from_numpy(np.asarray(sched.g[:, m])) for m, name in enumerate(["bb_ca", "local_latents"])}
+    gt = {name: torch.from_numpy(np.array(sched.g[:, m])) for m, name in enumerate(["bb_ca", "local_latents"])}
     args = _sampling_args("vf")
 
     draws, randn = [], torch.randn

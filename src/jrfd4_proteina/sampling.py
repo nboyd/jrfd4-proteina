@@ -10,6 +10,7 @@ contiguous slice of a `Schedule` from a given `State`, which is what partial dif
 from __future__ import annotations
 
 import itertools
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import equinox as eqx
@@ -24,22 +25,96 @@ from jrfd4_proteina.features import DecoderInputs, FlowInputs
 from jrfd4_proteina.layers import matmul_dtype
 from jrfd4_proteina.model import DecoderTransformer, FlowOutput, LocalLatentsTransformer
 
+# --------------------------------------------------------------------------- configuration
+
+_F32 = np.float32
+_TSR_T_MIN = _F32(1e-3)  # TSR time grids start here: the rescaled score is singular at t=0
+
 
 @dataclass(frozen=True)
-class ModalityConfig:
-    """Time schedule, noise schedule and step rule for one modality (static)."""
+class Uniform:
+    """Evenly spaced times on [t_min, 1]."""
 
-    schedule: str  # "uniform" | "power" | "log"
-    schedule_p: float
-    tail_steps: int  # final intervals sampled at `tail_step_multiplier` x density (0: off)
-    tail_step_multiplier: int
-    gt: str  # "1/t" | "tan" | "1-t/t" | "ode"
-    sampling_mode: str  # "vf_tsr" (temporal score rescaling) | "vf" (plain ODE)
-    sc_scale_noise: float
-    t_lim_ode: float  # deterministic above this time
-    t_lim_ode_below: float  # deterministic below this time
-    tsr_k: float
-    tsr_sigma: float
+    def __call__(self, nsteps: int, t_min: float) -> np.ndarray:
+        return np.linspace(t_min, 1, nsteps + 1, dtype=_F32)
+
+
+@dataclass(frozen=True)
+class Power:
+    """Times `s ** p` for evenly spaced `s` (p > 1 concentrates steps near t=0)."""
+
+    p: float
+
+    def __call__(self, nsteps: int, t_min: float) -> np.ndarray:
+        return np.linspace(t_min ** (1 / self.p), 1, nsteps + 1, dtype=_F32) ** _F32(self.p)
+
+
+@dataclass(frozen=True)
+class Log:
+    """Times `1 - 10 ** -u` for evenly spaced `u` on [0, p], rescaled to [t_min, 1] (dense near t=1)."""
+
+    p: float
+
+    def __call__(self, nsteps: int, t_min: float) -> np.ndarray:
+        t = (1.0 - (_F32(10.0) ** np.linspace(-self.p, t_min, nsteps + 1, dtype=_F32))[::-1]).astype(_F32)
+        t = t - (t.min() - t_min)
+        return (t / t.max()).astype(_F32)
+
+
+def one_over_t(t: np.ndarray) -> np.ndarray:
+    """g(t) = 1 / t (the reference's `1/t`)."""
+    return np.ones_like(t) / (t + _F32(1e-2))
+
+
+def one_minus_t_over_t(t: np.ndarray) -> np.ndarray:
+    """g(t) = (1 - t) / t (the reference's `1-t/t`)."""
+    return (1.0 - t) / (t + _F32(1e-2))
+
+
+def tangent(t: np.ndarray) -> np.ndarray:
+    """g(t) = (pi/2) tan(pi (1 - t) / 2) (the reference's `tan`)."""
+    return np.sin((1.0 - t) * np.pi / 2.0) * (np.pi / 2.0) / (np.cos((1.0 - t) * np.pi / 2.0) + _F32(1e-2))
+
+
+class TSR(eqx.Module):
+    """Temporal score rescaling: the score is scaled by `ratio(t)`, which rises from 1 at t=0 to `k` at t=1.
+
+    `k` and `sigma` may be JAX scalars (traced, so one compiled sampler can `vmap` over them) or Python floats
+    (compiled in).
+    """
+
+    k: float | Float[Array, ""]  # late-time score scale (lower: hotter)
+    sigma: float | Float[Array, ""]  # how early the rescaling sets in (higher: earlier)
+
+    def ratio(self, t):
+        snr = t**2 / (1 - t) ** 2
+        return (snr * self.sigma**2 + 1) / (snr * self.sigma**2 / self.k + 1)
+
+
+class Stochastic(eqx.Module):
+    """Langevin steps `dx = [v + g s] dt + sqrt(2 g noise_scale) dW` for step start times in `band`."""
+
+    g: Callable[[np.ndarray], np.ndarray] = eqx.field(static=True)  # noise schedule, e.g. `one_over_t`
+    band: tuple[float, float] = eqx.field(static=True)  # (t_min, t_max); deterministic outside
+    noise_scale: float | Float[Array, ""] = 1.0  # scales the injected noise only, not the `g s` drift
+
+
+class ModalityConfig(eqx.Module):
+    """Time grid and step rule for one modality.
+
+    Without `tsr` the sampler integrates the velocity field (a plain ODE); with it, the rescaled score, made
+    stochastic within `stochastic.band` when `stochastic` is given.
+    """
+
+    times: Uniform | Power | Log = eqx.field(static=True)
+    tail_steps: int = eqx.field(static=True)  # final intervals sampled at `tail_step_multiplier` x density (0: off)
+    tail_step_multiplier: int = eqx.field(static=True)
+    tsr: TSR | None
+    stochastic: Stochastic | None
+
+    def __check_init__(self):
+        if self.stochastic is not None and self.tsr is None:
+            raise ValueError("stochastic steps need TSR (the reference's untempered `sc` mode is not ported)")
 
 
 @dataclass(frozen=True)
@@ -50,22 +125,23 @@ class NoiseConfig:
     centering_scale: float | None  # stochastic x_0 offset per `molecule_iid` group (None: off)
 
 
-@dataclass(frozen=True)
-class SamplingConfig:
+class SamplingConfig(eqx.Module):
     bb_ca: ModalityConfig
     local_latents: ModalityConfig
-    nsteps: int
-    recycle_schedule: tuple[tuple[int, int], ...]  # (number of steps, trunk passes per step) bands
-    decode_with_predicted_sequence: bool
+    nsteps: int = eqx.field(static=True)
+    # (number of steps, trunk passes per step) bands
+    recycle_schedule: tuple[tuple[int, int], ...] = eqx.field(static=True)
+    decode_with_predicted_sequence: bool = eqx.field(static=True)
 
 
 def release_sampling_config() -> SamplingConfig:
     """The reference defaults: `generation/inference_base` with the medium front-loaded recycle schedule."""
-    common = {"sampling_mode": "vf_tsr", "sc_scale_noise": 1.0, "t_lim_ode": 0.95, "t_lim_ode_below": 0.02,
-                  "tail_steps": 10, "tail_step_multiplier": 2}
+    tail = {"tail_steps": 10, "tail_step_multiplier": 2}
     return SamplingConfig(
-        bb_ca=ModalityConfig(schedule="log", schedule_p=2.0, gt="1/t", tsr_k=16.0, tsr_sigma=3.0, **common),
-        local_latents=ModalityConfig(schedule="power", schedule_p=2.0, gt="tan", tsr_k=4.0, tsr_sigma=12.0, **common),
+        bb_ca=ModalityConfig(Log(p=2.0), tsr=TSR(k=16.0, sigma=3.0),
+                             stochastic=Stochastic(one_over_t, band=(0.02, 0.95)), **tail),
+        local_latents=ModalityConfig(Power(p=2.0), tsr=TSR(k=4.0, sigma=12.0),
+                                     stochastic=Stochastic(tangent, band=(0.02, 0.95)), **tail),
         nsteps=60,
         recycle_schedule=((5, 6), (10, 5), (5, 4), (10, 3), (20, 2), (10, 1)),
         decode_with_predicted_sequence=True,
@@ -75,51 +151,27 @@ def release_sampling_config() -> SamplingConfig:
 # --------------------------------------------------------------------------- schedules (host, float32)
 
 
-def _base_schedule(mode: str, nsteps: int, p: float, tsr_safe: bool) -> np.ndarray:
-    eps = np.float32(1e-3)
-    f32 = np.float32
-    if mode == "uniform":
-        return np.linspace(eps if tsr_safe else 0, 1, nsteps + 1, dtype=f32)
-    if mode == "power":
-        start = eps ** (1 / p) if tsr_safe else 0.0
-        return np.linspace(start, 1, nsteps + 1, dtype=f32) ** f32(p)
-    if mode == "log":
-        t = (1.0 - (f32(10.0) ** np.linspace(-p, eps if tsr_safe else 0.0, nsteps + 1, dtype=f32))[::-1]).astype(f32)
-        t = t - ((t.min() - eps) if tsr_safe else t.min())
-        return (t / t.max()).astype(f32)
-    raise ValueError(f"unknown schedule {mode!r}")
-
-
 def time_schedule(cfg: ModalityConfig, nsteps: int) -> np.ndarray:
     """`nsteps + 1` times from ~0 to 1 (starting at 1e-3 under TSR, where t=0 is singular)."""
-    tsr_safe = cfg.sampling_mode == "vf_tsr"
+    t_min = _TSR_T_MIN if cfg.tsr is not None else 0.0
     if not cfg.tail_steps:
-        return _base_schedule(cfg.schedule, nsteps, cfg.schedule_p, tsr_safe)
+        return cfg.times(nsteps, t_min)
     m = cfg.tail_step_multiplier
     base_steps = nsteps - (m - 1) * cfg.tail_steps
     if m < 2 or base_steps < cfg.tail_steps:
         raise ValueError("need tail_step_multiplier >= 2 and nsteps >= tail_steps * tail_step_multiplier")
     tail_start = (base_steps - cfg.tail_steps) * m
     indices = [*range(0, tail_start, m), *range(tail_start, base_steps * m + 1)]
-    return _base_schedule(cfg.schedule, base_steps * m, cfg.schedule_p, tsr_safe)[indices]
-
-
-def tsr_ratio(t, k: float, sigma: float):
-    snr = t**2 / (1 - t) ** 2
-    return (snr * sigma**2 + 1) / (snr * sigma**2 / k + 1)
+    return cfg.times(base_steps * m, t_min)[indices]
 
 
 def noise_schedule(cfg: ModalityConfig, t: np.ndarray) -> np.ndarray:
-    """g(t) of the SDE `dx = [v + g s] dt + sqrt(2 g) dW`, at the step start times `t`."""
-    if cfg.gt == "ode":
+    """g(t) of the SDE `dx = [v + g s] dt + sqrt(2 g) dW` at the step start times `t`, divided by the squared TSR
+    ratio to match the rescaled score (zero without `stochastic`)."""
+    if cfg.stochastic is None:
         return np.zeros_like(t)
-    tc = np.clip(t, 0, np.float32(1 - 1e-5))
-    num = {"1-t/t": 1.0 - tc, "1/t": np.ones_like(tc), "tan": np.sin((1.0 - tc) * np.pi / 2.0) * (np.pi / 2.0)}
-    den = {"1-t/t": tc, "1/t": tc, "tan": np.cos((1.0 - tc) * np.pi / 2.0)}
-    g = (num[cfg.gt] / (den[cfg.gt] + np.float32(1e-2))).astype(np.float32)
-    if cfg.sampling_mode == "vf_tsr":
-        g = g / tsr_ratio(t, cfg.tsr_k, cfg.tsr_sigma) ** 2  # ratio uses the unclamped times
-    return g.astype(np.float32)
+    g = cfg.stochastic.g(np.clip(t, 0, _F32(1 - 1e-5))).astype(_F32)
+    return (g / cfg.tsr.ratio(t) ** 2).astype(_F32)  # the ratio uses the unclamped times
 
 
 class Schedule(eqx.Module):
@@ -147,9 +199,11 @@ def _schedule_from_times(config: SamplingConfig, times: tuple[np.ndarray, np.nda
     gs, stoch = [], []
     for cfg, t in zip((config.bb_ca, config.local_latents), times, strict=True):
         gs.append(noise_schedule(cfg, t[:-1]))
-        stoch.append((t[:-1] <= cfg.t_lim_ode) & (t[:-1] >= cfg.t_lim_ode_below) & (cfg.sampling_mode == "vf_tsr"))
+        lo, hi = cfg.stochastic.band if cfg.stochastic is not None else (np.inf, -np.inf)
+        stoch.append((t[:-1] >= lo) & (t[:-1] <= hi))
     t = np.stack(times, -1)
-    return Schedule(t[:-1], t[1:], np.stack(gs, -1), np.stack(stoch, -1), tuple(depths))
+    g = jnp.stack(gs, -1)  # traced when a TSR parameter is
+    return Schedule(t[:-1], t[1:], g, np.stack(stoch, -1), tuple(depths))
 
 
 def _recycle_depths(config: SamplingConfig) -> tuple[int, ...]:
@@ -316,13 +370,14 @@ def corrupt(
 
 def _step(cfg: ModalityConfig, x, v, t, t_next, g, stochastic, eps, emit):
     dt = t_next - t
-    if cfg.sampling_mode == "vf":
+    if cfg.tsr is None:
         dx = v * dt
     else:
-        scaled_score = (t * v - x) / (1.0 - t) * tsr_ratio(t, cfg.tsr_k, cfg.tsr_sigma)
+        scaled_score = (t * v - x) / (1.0 - t) * cfg.tsr.ratio(t)
         v_scaled = (x + (1.0 - t) * scaled_score) / t
+        noise_scale = cfg.stochastic.noise_scale if cfg.stochastic is not None else 0.0
         drift = jnp.where(stochastic, v_scaled + g * scaled_score, v_scaled)
-        diffusion = jnp.where(stochastic, jnp.sqrt(2 * g * cfg.sc_scale_noise * dt), 0.0)
+        diffusion = jnp.where(stochastic, jnp.sqrt(2 * g * noise_scale * dt), 0.0)
         dx = drift * dt + diffusion * eps
     return (x + dx) * emit[:, None]
 

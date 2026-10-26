@@ -81,7 +81,7 @@ residue types: Jensen-Shannon distance 0.016, chi-squared p 0.76).
 | `LocalLatentsTransformer.__call__(batch, FlowInputs, n_recycle) -> FlowOutput` | one network evaluation (velocities, sequence and insertion logits) |
 | `DecoderTransformer.__call__(batch, DecoderInputs, required_atom_mask=None) -> DecoderOutput` | |
 | `RFD4Proteina.bfloat16() -> RFD4Proteina` | bf16 mixed-precision flow trunk (see above); `layers.matmul_dtype` for any module |
-| `SamplingConfig` / `release_sampling_config()` | schedules, TSR temperature, recycle bands (reference defaults: 60 steps, medium front-loaded recycling) |
+| `SamplingConfig` / `release_sampling_config()` | schedules, TSR temperature, recycle bands (reference defaults: 60 steps, medium front-loaded recycling). Per modality: a time grid (`Log(p)`, `Power(p)`, `Uniform()`), `tsr=TSR(k, sigma)` or `None` (plain ODE), and `stochastic=Stochastic(g, band, noise_scale)` or `None` (deterministic). `TSR` and `noise_scale` fields may be JAX scalars, so one compiled sampler can `vmap` over temperatures |
 | `Batch` | typed design inputs; `Batch.from_reference` adapts the reference collated batch |
 | `convert.load / convert_model / featurize / batch_from_reference` | torch-dependent conversion |
 | `io.save / io.load` | torch-free serialization |
@@ -142,9 +142,9 @@ under `stop_gradient` (as in the reference) and the final one is differentiated.
   including coordinate/annotation conditioning, chirality vectors with noise alignment, and per-call random
   relabelling of coordinate groups; pair-biased attention with adaptive norms, triangle multiplicative
   updates, recycling with remaining-pass conditioning, sequence and insertion heads.
-* Sampler: TSR-safe log/power schedules with dense tails, `1/t` and `tan` noise schedules, the `vf_tsr`
-  step (temporal score rescaling, stochastic in the middle band, deterministic near both ends) and the plain
-  `vf` ODE; zero-COM initial noise with per-molecule stochastic centering; banded recycle depths.
+* Sampler: TSR-safe log/power schedules with dense tails, `1/t`, `1-t/t` and `tan` noise schedules, the
+  `vf_tsr` step (temporal score rescaling, stochastic in the middle band, deterministic near both ends) and the
+  plain `vf` ODE (the reference's untempered stochastic `sc` mode is not ported); zero-COM initial noise with per-molecule stochastic centering; banded recycle depths.
 * AE decoder (`DecoderTransformer`) and sequence-conditioned decoding.
 
 * Partial diffusion (`partial_trajectory_fraction_steps`, explicit and coupled `partial_t_*`), inverse folding

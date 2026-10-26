@@ -12,6 +12,7 @@ from jrfd4_proteina import constants as C
 from jrfd4_proteina.batch import Batch
 from jrfd4_proteina.model import DecoderOutput, FlowOutput
 from jrfd4_proteina.sampling import (
+    TSR,
     NoiseConfig,
     RFD4Proteina,
     State,
@@ -22,6 +23,7 @@ from jrfd4_proteina.sampling import (
     inverse_fold,
     partial_schedule,
     release_sampling_config,
+    sample,
     schedule,
     simulate,
 )
@@ -150,6 +152,28 @@ def test_simulating_in_pieces_matches_one_run():
     np.testing.assert_allclose(piece.bb_ca, whole.final.bb_ca, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(piece.local_latents, whole.final.local_latents, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(trajectory.clean.bb_ca, whole.clean.bb_ca, rtol=1e-5, atol=1e-6)
+
+
+def test_temperatures_can_be_traced_and_vmapped():
+    model, batch, config, key = toy_model(), toy_batch(), toy_config(), jax.random.key(0)
+
+    def at(k, sigma, scale):
+        bb_ca, latents = config.bb_ca, config.local_latents
+        return dataclasses.replace(
+            config,
+            bb_ca=dataclasses.replace(bb_ca, tsr=TSR(k, bb_ca.tsr.sigma),
+                                      stochastic=dataclasses.replace(bb_ca.stochastic, noise_scale=scale)),
+            local_latents=dataclasses.replace(latents, tsr=TSR(latents.tsr.k, sigma)),
+        )
+
+    settings = [(4.0, 12.0, 1.0), (16.0, 3.0, 0.5)]
+    swept = jax.vmap(lambda k, sigma, scale: sample(model, batch, at(k, sigma, scale), key=key).trajectory.final)(
+        *map(jnp.array, zip(*settings)))
+    for i, setting in enumerate(settings):
+        one = sample(model, batch, at(*setting), key=key).trajectory.final  # Python floats: compiled in
+        np.testing.assert_allclose(swept.bb_ca[i], one.bb_ca, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(swept.local_latents[i], one.local_latents, rtol=1e-5, atol=1e-6)
+    assert not np.allclose(swept.bb_ca[0], swept.bb_ca[1])  # the settings matter
 
 
 def test_corrupt_interpolates_from_the_initial_noise():
