@@ -1,4 +1,4 @@
-"""Input features of the flow network and the AE decoder, for a single example.
+"""Input features of the flow network and the AE encoder and decoder, for a single example.
 
 Each feature maps `(batch, inputs) -> array` of shape `[d]` (per example), `[N, d]` (per token) or
 `[N, N, d]` (per pair); a `FeatureFactory` concatenates its features in checkpoint order and projects
@@ -36,6 +36,10 @@ class FlowInputs(eqx.Module):
 class DecoderInputs(eqx.Module):
     ca_coors_nm: Float[Array, "N 3"]
     z_latent: Float[Array, "N L"]
+
+
+class EncoderInputs(eqx.Module):
+    coords_nm: Float[Array, "N 37 3"]  # the structure to encode; slots outside `batch.atom37_mask` are ignored
 
 
 def time_embedding(t: Float[Array, ""], dim: int, max_positions: int = 2000) -> Float[Array, " D"]:
@@ -96,6 +100,19 @@ class Latent(eqx.Module):
         return inputs.z_latent
 
 
+class Atom37Coords(eqx.Module):
+    """Flattened atom37 coordinates (nm; relative to CA if `rel`) and the atom mask."""
+
+    rel: bool = eqx.field(static=True)
+
+    def __call__(self, batch: Batch, inputs: EncoderInputs):
+        mask = batch.atom37_mask
+        coords = inputs.coords_nm * mask[..., None]  # NaN (unresolved) atoms stay NaN, as in the reference
+        if self.rel:
+            coords = (coords - coords[:, 1:2]) * mask[..., None]
+        return jnp.concatenate([coords.reshape(coords.shape[0], -1), mask.astype(jnp.float32)], -1)
+
+
 # --------------------------------------------------------------------------- token identity
 
 
@@ -141,6 +158,31 @@ class AtomicElement(eqx.Module):
     def __call__(self, batch: Batch, inputs):
         index = jnp.clip(batch.element[:, 1].astype(jnp.int32), 0, self.embedding.weight.shape[0] - 1)
         return self.embedding(index) * _atomized(batch)
+
+
+class ChainIndex(eqx.Module):
+    def __call__(self, batch: Batch, inputs):
+        return batch.chain_iid[:, None].astype(jnp.float32)
+
+
+class Atom37ElementCharge(eqx.Module):
+    """Element and charge embeddings of every present atom37 slot (input structure), flattened."""
+
+    element_embedding: Embedding
+    charge_embedding: Embedding
+
+    def __call__(self, batch: Batch, inputs):
+        mask = batch.atom37_mask
+        element = jnp.where(mask, batch.ground_truth_element, 0).astype(jnp.int32)
+        charge = jnp.clip(jnp.where(mask, batch.charge, 0).astype(jnp.int32) + 4, 0, 10)
+        encoded = jnp.concatenate([self.element_embedding(element), self.charge_embedding(charge)], -1)
+        return (encoded * mask[..., None]).reshape(mask.shape[0], -1)
+
+
+class IncidentBondTypeCounts(eqx.Module):
+    def __call__(self, batch: Batch, inputs):
+        counts = batch.incident_bond_type_counts.astype(jnp.float32) * batch.atom37_mask[..., None]
+        return counts.reshape(counts.shape[0], -1)
 
 
 class CathCode(eqx.Module):
@@ -396,7 +438,8 @@ def _convert_feature(m) -> eqx.Module:
         "ConditionalAtom37NanometersCoorsSeqFeat": CondCoords, "RasaBinnedSeqFeat": Rasa,
         "ModernizedHydrogenBondSeqFeat": HBond, "PiCationSeqFeat": PiCation, "ChainCentroidXyzSeqFeat": ChainCentroid,
         "NucleicSecondaryStructureStateSeqFeat": NaSsState, "CoordGroupSeqFeat": CoordGroup,
-        "NucleicSecondaryStructurePairFeat": NaSsPair,
+        "NucleicSecondaryStructurePairFeat": NaSsPair, "ChainIdxSeqFeat": ChainIndex,
+        "IncidentBondTypeCountsSeqFeat": IncidentBondTypeCounts,
     }
     flags = {
         "PiStackingSeqFeat": "pistack", "SaltBridgeSeqFeat": "saltbridge", "HydrophobicSeqFeat": "hydrophobic",
@@ -430,6 +473,10 @@ def _convert_feature(m) -> eqx.Module:
         return AtomCharge(embedding=from_torch(m.embedding))
     if kind == "AtomicElementSeqFeat":
         return AtomicElement(embedding=from_torch(m.embedding))
+    if kind == "Atom37ElementChargeEmbeddingSeqFeat":
+        return Atom37ElementCharge(from_torch(m.element_embedding), from_torch(m.charge_embedding))
+    if kind == "Atom37NanometersCoorsSeqFeat":
+        return Atom37Coords(rel=m.rel)
     if kind == "FoldEmbeddingSeqFeat":
         return CathCode(*(from_torch(getattr(m, f"embedding_{c}")) for c in "CAT"))
     if kind == "SecondaryStructureSeqFeat":

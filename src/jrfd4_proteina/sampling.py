@@ -1,5 +1,5 @@
-"""Flow-matching sampler (the reference's `ProductSpaceFlowMatcher.full_simulation` / `partial_simulation`) and
-decoding.
+"""Flow-matching sampler (the reference's `ProductSpaceFlowMatcher.full_simulation` / `partial_simulation`),
+encoding and decoding.
 
 Two modalities are integrated jointly from t=0 (noise) to t=1 (data): CA coordinates (nm) and local
 latents. Each step evaluates the flow network at a recycle depth fixed by a banded schedule; each band
@@ -21,9 +21,9 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from jrfd4_proteina import constants as C
 from jrfd4_proteina.batch import Batch
-from jrfd4_proteina.features import DecoderInputs, FlowInputs
+from jrfd4_proteina.features import DecoderInputs, EncoderInputs, FlowInputs
 from jrfd4_proteina.layers import matmul_dtype
-from jrfd4_proteina.model import DecoderTransformer, FlowOutput, LocalLatentsTransformer
+from jrfd4_proteina.model import DecoderTransformer, EncoderTransformer, FlowOutput, LocalLatentsTransformer
 
 # --------------------------------------------------------------------------- configuration
 
@@ -487,11 +487,29 @@ def decode(decoder: DecoderTransformer, batch: Batch, trajectory: Trajectory, co
     )
 
 
+@eqx.filter_jit
+def encode(
+    encoder: EncoderTransformer, batch: Batch, *, key: PRNGKeyArray | None, coords: Float[Array, "N 37 3"] | None = None
+) -> State:
+    """The clean `State` of a structure: its CA trace and AE-encoded local latents (the reference's `x_1`).
+
+    `coords` (Å, atom37, laid out as `batch`) defaults to `batch.coords`, the featurized input structure; atom
+    identities (mask, elements, charges, bonds) always come from `batch`. Latents are a posterior draw, as in the
+    reference, or with `key=None` the posterior mean. Every atom of an encoded token must be resolved: NaN
+    coordinates make every latent NaN (the reference's training pipeline drops such tokens).
+    """
+    coords_nm = jnp.asarray(batch.coords if coords is None else coords) / 10.0
+    posterior = encoder(batch, EncoderInputs(coords_nm))
+    latents = posterior.mean if key is None else posterior.sample(key, batch.latent_mask)
+    return State(coords_nm[:, 1], latents)
+
+
 class RFD4Proteina(eqx.Module):
-    """The flow network, the AE decoder and the trained noise settings."""
+    """The flow network, the AE encoder and decoder and the trained noise settings."""
 
     flow: LocalLatentsTransformer
     decoder: DecoderTransformer
+    encoder: EncoderTransformer
     noise_bb_ca: NoiseConfig = eqx.field(static=True)
     noise_local_latents: NoiseConfig = eqx.field(static=True)
     latent_dim: int = eqx.field(static=True)
@@ -528,9 +546,10 @@ def partial_diffuse(
     t_bb_ca: float | None = None,
     t_local_latents: float | None = None,
 ) -> Design:
-    """Re-noise `clean` (e.g. `design.trajectory.final`) to the start of a `partial_schedule` and regenerate.
+    """Re-noise `clean` to the start of a `partial_schedule` and regenerate.
 
-    Clean latents of an arbitrary structure need the AE encoder, which is not ported.
+    `clean` is e.g. `design.trajectory.final`, or `encode(model.encoder, batch, key=...)` for the batch's input
+    structure (as the reference does).
     """
     sched, start = partial_schedule(config, fraction=fraction, t_bb_ca=t_bb_ca, t_local_latents=t_local_latents)
     noise = draw_noise(key, batch, nsteps=len(sched), latent_dim=model.latent_dim)

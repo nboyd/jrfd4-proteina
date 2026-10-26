@@ -10,7 +10,7 @@ import pytest
 
 from jrfd4_proteina import constants as C
 from jrfd4_proteina.batch import Batch
-from jrfd4_proteina.model import DecoderOutput, FlowOutput
+from jrfd4_proteina.model import DecoderOutput, EncoderOutput, FlowOutput
 from jrfd4_proteina.sampling import (
     TSR,
     NoiseConfig,
@@ -19,8 +19,10 @@ from jrfd4_proteina.sampling import (
     corrupt,
     decode,
     draw_noise,
+    encode,
     initial_state,
     inverse_fold,
+    partial_diffuse,
     partial_schedule,
     release_sampling_config,
     sample,
@@ -37,10 +39,11 @@ def toy_batch() -> Batch:
         "sequence_probabilities": (N, len(C.SEQUENCE_PROBABILITY_RESIDUES)), "cath": (N, 3), "chain_centroid": (N, 3),
         "chirality": (N, 3 * C.MAX_CHIRAL_CENTERS), "chiral_frame_atoms": (N, C.MAX_CHIRAL_CENTERS, 4),
         "chiral_slot_owner": (N, C.MAX_CHIRAL_CENTERS), "cond_coords": (N, 37, 3), "cond_internal_coords": (N, 37, 3),
+        "coords": (N, 37, 3), "incident_bond_type_counts": (N, 37, 10),
     }
     pair = {"bond_mask", "bond_order", "is_aromatic", "token_bond_path_length", "canonical_polymer_ordering",
             "na_ss_pair", "na_ss_pair_mask"}
-    atom = {"atom37_mask", "charge", "element", "coord_group", "rasa", "hbond", "pistack", "pication", "saltbridge",
+    atom = {"atom37_mask", "charge", "element", "ground_truth_element", "coord_group", "rasa", "hbond", "pistack", "pication", "saltbridge",
             "hydrophobic", "metal_coord", "hotspot"}
     fields = {}
     for name in Batch.__dataclass_fields__:
@@ -77,10 +80,18 @@ class ToyDecoder(eqx.Module):
                              jnp.zeros((N, C.N_RESIDUE_TYPES)))
 
 
+class ToyEncoder(eqx.Module):
+    """Latents from the first L atom slots' x coordinates, with a fixed posterior scale."""
+
+    def __call__(self, batch, inputs):
+        emit = batch.latent_mask[:, None]
+        return EncoderOutput(inputs.coords_nm[:, :L, 0] * emit, jnp.full((N, L), -1.0) * emit)
+
+
 def toy_model() -> RFD4Proteina:
     target = jax.random.normal(jax.random.key(1), (N, 3))
     return RFD4Proteina(ToyFlow(target), ToyDecoder(jnp.ones((C.N_TOKEN_TYPES, C.N_RESIDUE_TYPES), bool)),
-                        NoiseConfig(zero_com=True, centering_scale=0.2), NoiseConfig(False, None), L)
+                        ToyEncoder(), NoiseConfig(zero_com=True, centering_scale=0.2), NoiseConfig(False, None), L)
 
 
 def toy_config(nsteps=24):
@@ -184,6 +195,29 @@ def test_corrupt_interpolates_from_the_initial_noise():
     x = corrupt(batch, clean, jnp.array([0.0, 1.0]), noise, model.noise_config)
     np.testing.assert_allclose(x.bb_ca, x0.bb_ca)
     np.testing.assert_allclose(x.local_latents, np.asarray(batch.padding_mask)[:, None] * np.ones((N, L)))
+
+
+def test_encode_returns_the_structure_ca_and_posterior_latents():
+    model, batch = toy_model(), toy_batch()
+    coords = 10.0 * jax.random.normal(jax.random.key(4), (N, 37, 3))
+    batch = dataclasses.replace(batch, coords=coords)
+    emit = np.asarray(batch.latent_mask)[:, None]
+    mean = encode(model.encoder, batch, key=None)
+    np.testing.assert_allclose(mean.bb_ca, coords[:, 1] / 10.0, rtol=1e-6)
+    np.testing.assert_allclose(mean.local_latents, coords[:, :L, 0] / 10.0 * emit, rtol=1e-6)
+    draw = encode(model.encoder, batch, key=jax.random.key(0))
+    noise = (np.asarray(draw.local_latents) - np.asarray(mean.local_latents)) / np.exp(-1.0)
+    assert np.all(noise[~emit[:, 0]] == 0) and 0.5 < noise[emit[:, 0]].std() < 1.5
+    np.testing.assert_allclose(encode(model.encoder, toy_batch(), key=None, coords=coords).local_latents,
+                               mean.local_latents)
+
+
+def test_partial_diffusion_from_an_encoded_structure():
+    model, batch, config = toy_model(), toy_batch(), toy_config()
+    batch = dataclasses.replace(batch, coords=10.0 * jax.random.normal(jax.random.key(4), (N, 37, 3)))
+    clean = encode(model.encoder, batch, key=jax.random.key(0))
+    design = partial_diffuse(model, batch, config, clean, key=jax.random.key(1), fraction=0.25)
+    assert np.isfinite(np.asarray(design.coords)).all()
 
 
 def test_inverse_folding_keeps_the_backbone():

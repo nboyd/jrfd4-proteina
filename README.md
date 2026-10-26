@@ -1,14 +1,15 @@
 # jrfd4-proteina
 
 A JAX/Equinox port of the inference path of [RFD4-Proteina](https://github.com/RosettaCommons/RFD4-Proteina)
-(Baker Lab × NVIDIA GenAIR): the flow network, the flow-matching sampler and the autoencoder decoder.
+(Baker Lab × NVIDIA GenAIR): the flow network, the flow-matching sampler and the autoencoder.
 Everything is single-example, pure and jittable; batch with `jax.vmap`.
 
 RFD4-Proteina is a **flow-matching** model (Proteina lineage), not an AF3-style EDM diffusion model. It
 integrates two modalities jointly from noise (t=0) to data (t=1): per-token CA coordinates (nm) and
 32-dimensional per-token local latents. A transformer with pair-biased attention and triangle updates
 predicts their velocities, recycling its trunk a schedule-dependent number of times per step, and an
-autoencoder decoder maps the final CA + latents to residue types and atom37 coordinates.
+autoencoder decoder maps the final CA + latents to residue types and atom37 coordinates (its encoder maps a
+structure to latents, for partial diffusion from an input structure).
 
 ## Install
 
@@ -46,7 +47,7 @@ designs = eqx.filter_jit(eqx.filter_vmap(lambda m, b, k: sample(m, b, config, ke
 
 `model.bfloat16()` returns a copy that runs the flow trunk in bf16 mixed precision, as the reference's `bf16-mixed`
 default does: matmuls take bf16 inputs and accumulate in float32, norms and softmax statistics run in float32, residual
-streams stay float32, and the flow's output heads and the decoder are untouched, so the integrator only sees float32
+streams stay float32, and the flow's output heads and the autoencoder are untouched, so the integrator only sees float32
 velocities. Precision follows the weights' dtype, so the float32 model is unaffected.
 
 ```python
@@ -74,12 +75,14 @@ residue types: Jensen-Shannon distance 0.016, chi-squared p 0.76).
 | `integrate(flow, batch, noise, config, noise_config) -> Trajectory` | deterministic sampler given `Noise` (reverse-mode differentiable) |
 | `simulate(flow, batch, state, schedule, steps, config, noise_config, fixed_bb_ca=None) -> Trajectory` | integrate a `State` through any slice of a `Schedule` |
 | `schedule(config)` / `partial_schedule(config, *, fraction \| t_bb_ca, t_local_latents)` | per-step times, noise scales and recycle depths; slice with `[a:b]` |
-| `partial_diffuse(model, batch, config, clean, *, key, ...)` / `corrupt(...)` | partial diffusion from a clean `State` (e.g. `design.trajectory.final`) |
+| `partial_diffuse(model, batch, config, clean, *, key, ...)` / `corrupt(...)` | partial diffusion from a clean `State` (e.g. `design.trajectory.final`, or `encode(...)`) |
+| `encode(encoder, batch, *, key, coords=None) -> State` | AE-encode a structure (default: the batch's input structure) to its clean CA + latents; `key=None` gives the posterior mean |
 | `inverse_fold(model, batch, config, ca, *, key)` | generate latents/sequence for a fixed CA trace (Å) |
 | `search.beam_search(model, batch, config, checkpoints, *, key, ...)` | reward-guided beam search |
 | `decode(decoder, batch, trajectory, config) -> Design` | AE decode, conditioned on the predicted sequence |
 | `LocalLatentsTransformer.__call__(batch, FlowInputs, n_recycle) -> FlowOutput` | one network evaluation (velocities, sequence and insertion logits) |
 | `DecoderTransformer.__call__(batch, DecoderInputs, required_atom_mask=None) -> DecoderOutput` | |
+| `EncoderTransformer.__call__(batch, EncoderInputs) -> EncoderOutput` | posterior `mean`, `log_scale` over the latents |
 | `RFD4Proteina.bfloat16() -> RFD4Proteina` | bf16 mixed-precision flow trunk (see above); `layers.matmul_dtype` for any module |
 | `SamplingConfig` / `release_sampling_config()` | schedules, TSR temperature, recycle bands (reference defaults: 60 steps, medium front-loaded recycling). Per modality: a time grid (`Log(p)`, `Power(p)`, `Uniform()`), `tsr=TSR(k, sigma)` or `None` (plain ODE), and `stochastic=Stochastic(g, band, noise_scale)` or `None` (deterministic). `TSR` and `noise_scale` fields may be JAX scalars, so one compiled sampler can `vmap` over temperatures |
 | `Batch` | typed design inputs; `Batch.from_reference` adapts the reference collated batch |
@@ -109,6 +112,22 @@ design = sample(model, batch, release_sampling_config(), key=jax.random.key(0))
 
 A `Batch` holds one sampled layout (one binder length): featurize again, with other seeds or fixed lengths
 (`"contig": "80, /0, A17-131"`), to cover a range. Featurizing takes ~0.3 s after the first call.
+
+### Partial diffusion from an input structure
+
+Residues the spec takes from the input but does not condition on are generated, and featurization carries their
+structure (`batch.coords`, Å). `encode` turns it into the clean state, as the reference's partial diffusion does:
+
+```python
+from jrfd4_proteina import encode, partial_diffuse
+
+batch = convert.featurize({"redesign": {"input": "tests/data/5o45_cropped.cif.zst", "contig": "A83-124"}})[0]
+clean = encode(model.encoder, batch, key=jax.random.key(0))     # CA trace + a posterior draw of the latents
+design = partial_diffuse(model, batch, config, clean, key=jax.random.key(1), fraction=0.3)
+```
+
+Every atom of an encoded residue must be resolved: the reference's training pipeline drops residues with missing
+atoms, and NaN coordinates make every latent NaN.
 
 ### Beam search
 
@@ -145,14 +164,15 @@ under `stop_gradient` (as in the reference) and the final one is differentiated.
 * Sampler: TSR-safe log/power schedules with dense tails, `1/t`, `1-t/t` and `tan` noise schedules, the
   `vf_tsr` step (temporal score rescaling, stochastic in the middle band, deterministic near both ends) and the
   plain `vf` ODE (the reference's untempered stochastic `sc` mode is not ported); zero-COM initial noise with per-molecule stochastic centering; banded recycle depths.
-* AE decoder (`DecoderTransformer`) and sequence-conditioned decoding.
+* AE decoder (`DecoderTransformer`) and sequence-conditioned decoding; AE encoder (`EncoderTransformer`: atom37
+  coordinates, elements, charges, incident bond types, chain index), as the reference uses it to get the clean
+  latents of an input structure.
 
 * Partial diffusion (`partial_trajectory_fraction_steps`, explicit and coupled `partial_t_*`), inverse folding
   (`resampled_forward_marginal`) and beam search (`BeamSearchStrategy`: per-checkpoint rewards and branching,
   rollout or clean-prediction scoring, continuation criteria, resuming from saved states).
 
-Not ported: training, the AE encoder (so partial diffusion starts from latents this model produced, not from an
-arbitrary structure), classifier-free guidance (unused by the release checkpoint), differentiable-metric
+Not ported: training, classifier-free guidance (unused by the release checkpoint), differentiable-metric
 guidance, metrics and refolding oracles. Featurization is delegated to the reference
 pipeline (`convert.featurize`, needs torch; condition specs only, not condition-annotated CIFs); a torch-free
 featurizer is not included.
@@ -168,6 +188,8 @@ benchmark. Relative errors are `max|Δ| / max|reference|`.
 | Every feature creator and factory | exact, except time embeddings (below) |
 | Full network forward, recycle depth 2 (velocities, sequence logits) | 5e-7 – 1e-6; insertion logits 2e-6 |
 | AE decoder | 2e-5; residue types and atom masks identical |
+| AE encoder (42 PD-L1 residues after a 20-residue generated chain) | posterior mean 3e-6, log-scale 1e-6 |
+| AE round trip (decode the encoded mean at the true CA; a property of the released AE, not of the port) | residue types and atom masks exact, 0.13 Å RMSD |
 | Time / noise schedules | 1 ulp |
 | End-to-end sampling with replayed noise, plain ODE (24 steps, 42 trunk passes) | CA 2e-5, decoded atoms < 0.012 Å, residue types identical |
 | End-to-end sampling with replayed noise, release TSR sampler | identical noise consumption; every step agrees to ~1e-6 from the reference state |

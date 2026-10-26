@@ -1,4 +1,4 @@
-"""The RFD4-Proteina flow network (`LocalLatentsTransformer`) and AE decoder (`DecoderTransformer`)."""
+"""The RFD4-Proteina flow network (`LocalLatentsTransformer`) and AE (`EncoderTransformer`, `DecoderTransformer`)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ import dataclasses
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from jrfd4_proteina import constants as C
 from jrfd4_proteina.backend import from_torch, register_from_torch, stack_modules
 from jrfd4_proteina.batch import Batch
 from jrfd4_proteina.features import (
     DecoderInputs,
+    EncoderInputs,
     FeatureFactory,
     FlowInputs,
     ZeroFeatures,
@@ -270,3 +271,47 @@ class DecoderTransformer(eqx.Module):
             emit_mask=emit,
             seq_logits=logits,
         )
+
+
+class EncoderOutput(eqx.Module):
+    mean: Float[Array, "N L"]  # zero outside `batch.latent_mask`
+    log_scale: Float[Array, "N L"]
+
+    def sample(self, key: PRNGKeyArray, emit: Bool[Array, " N"]) -> Float[Array, "N L"]:
+        """A posterior draw `mean + eps * exp(log_scale)`, zeroed outside `emit`."""
+        eps = jax.random.normal(key, self.mean.shape, self.mean.dtype)
+        return (self.mean + eps * jnp.exp(self.log_scale)) * emit[:, None]
+
+
+@register_from_torch("rfproteina.partial_autoencoder.encoder.EncoderTransformer")
+class EncoderTransformer(eqx.Module):
+    """AE encoder: (atom37 structure, token annotations) -> Gaussian posterior over the local latents."""
+
+    init_repr_factory: FeatureFactory
+    cond_factory: FeatureFactory | ZeroFeatures
+    transition_c_1: Transition
+    transition_c_2: Transition
+    trunk: Trunk
+    latent_decoder_mean_n_log_scale: NormLinear
+
+    @classmethod
+    def from_torch(cls, m) -> EncoderTransformer:
+        if m.use_attn_pair_bias or m.update_pair_repr or type(m.ln_z).__name__ != "Identity":
+            raise NotImplementedError("only the released encoder (no pair track, unnormalised latents) is ported")
+        return cls(
+            init_repr_factory=from_torch(m.init_repr_factory),
+            cond_factory=from_torch(m.cond_factory),
+            transition_c_1=from_torch(m.transition_c_1),
+            transition_c_2=from_torch(m.transition_c_2),
+            trunk=Trunk.from_torch(m.transformer_layers, None, 1),
+            latent_decoder_mean_n_log_scale=NormLinear.from_torch(m.latent_decoder_mean_n_log_scale),
+        )
+
+    def __call__(self, batch: Batch, inputs: EncoderInputs) -> EncoderOutput:
+        attention, emit = batch.design_mask, batch.latent_mask
+        c = self.cond_factory(batch, inputs)
+        c = self.transition_c_2(self.transition_c_1(c, attention), attention)
+        s = self.init_repr_factory(batch, inputs) * attention[:, None]
+        s, _ = self.trunk(s, None, c, attention)
+        mean, log_scale = jnp.split(self.latent_decoder_mean_n_log_scale(s) * emit[:, None], 2, -1)
+        return EncoderOutput(mean, log_scale)

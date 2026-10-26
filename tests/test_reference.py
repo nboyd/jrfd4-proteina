@@ -109,6 +109,45 @@ def test_decoder_parity(reference):
     np.testing.assert_array_equal(np.asarray(out.atom_mask), ref["atom_mask"][0].numpy())
 
 
+def test_encoder_parity(structure_reference):
+    import jax
+    import torch
+
+    from jrfd4_proteina.features import EncoderInputs
+    from jrfd4_proteina.sampling import encode
+
+    torch_model, model, torch_batch, batch = structure_reference
+    with torch.no_grad():
+        ref = torch_model.autoencoder.encode(torch_batch)
+        x_1 = torch_model.add_clean_samples(dict(torch_batch))["x_1"]
+    clean = encode(model.encoder, batch, key=None)
+    out = model.encoder(batch, EncoderInputs(batch.coords / 10.0))
+    assert rel(out.mean, ref["mean"][0]) < 1e-5
+    assert rel(out.log_scale, ref["log_scale"][0]) < 1e-5
+    assert rel(clean.local_latents, ref["mean"][0]) < 1e-5
+    np.testing.assert_allclose(clean.bb_ca, x_1["bb_ca"][0].numpy(), rtol=0, atol=1e-6)
+    drawn = encode(model.encoder, batch, key=jax.random.key(0)).local_latents
+    np.testing.assert_array_equal(np.asarray(drawn) == 0, x_1["local_latents"][0].numpy() == 0)  # same emit mask
+
+
+def test_autoencoder_round_trip(structure_reference):
+    """Decoding the encoded posterior mean at the true CA trace reconstructs the input structure."""
+    from jrfd4_proteina.features import DecoderInputs
+    from jrfd4_proteina.sampling import encode
+
+    _, model, torch_batch, batch = structure_reference
+    clean = encode(model.encoder, batch, key=None)
+    out = model.decoder(batch, DecoderInputs(clean.bb_ca, clean.local_latents))
+    structured = np.asarray(batch.latent_mask) & (np.asarray(batch.atom37_mask).sum(-1) > 1)
+    assert structured.sum() == 42
+    np.testing.assert_array_equal(np.asarray(out.residue_type)[structured],
+                                  torch_batch["residue_type"][0].numpy()[structured])
+    np.testing.assert_array_equal(np.asarray(out.atom_mask)[structured], np.asarray(batch.atom37_mask)[structured])
+    mask = np.asarray(out.atom_mask) & structured[:, None]
+    error = np.linalg.norm(np.asarray(out.coords_nm) * 10.0 - np.asarray(batch.coords), axis=-1)[mask]
+    assert np.sqrt((error**2).mean()) < 0.2 and error.max() < 1.5  # Å; the released AE: 0.13 RMSD, 1.0 max
+
+
 def _replay(torch_model, torch_batch, batch, model, mode: str, nsteps: int, bands):
     """Run torch `full_simulation` recording every randn draw, then feed the draws to `integrate`."""
     import torch

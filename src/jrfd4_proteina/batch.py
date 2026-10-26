@@ -25,12 +25,18 @@ class Batch(eqx.Module):
     coord_cond_mask: Bool[Arr, " N"]
     # Token identity
     token_type: Int[Arr, " N"]
+    chain_iid: Int[Arr, " N"]
     molecule_iid: Int[Arr, " N"]
     molecule_entity_id: Int[Arr, " N"]
     # Atom37 identity
     atom37_mask: Bool[Arr, "N 37"]
     charge: Int[Arr, "N 37"]
-    element: Int[Arr, "N 37"]
+    element: Int[Arr, "N 37"]  # sequence-conditioned tokens only (-1 elsewhere)
+    # Input structure (read by the AE encoder): coordinates in Å, NaN at unresolved atoms; zeros on tokens the
+    # spec generates from scratch
+    coords: Float[Arr, "N 37 3"]
+    ground_truth_element: Int[Arr, "N 37"]
+    incident_bond_type_counts: Int[Arr, "N 37 10"]  # per atom slot, bonds of each Biotite bond type
     # Conditioning annotations
     cond_sequence: Int[Arr, " N"]
     sequence_probabilities: Float[Arr, "N R"]

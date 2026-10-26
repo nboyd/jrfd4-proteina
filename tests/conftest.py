@@ -69,3 +69,27 @@ def _reference_batch(inputs: str) -> dict:
     batch["coords_nm"] = batch["coords"] / 10.0
     batch["coord_mask"] = batch["atom37_mask"]
     return batch
+
+
+@pytest.fixture(scope="session")
+def structure_reference(reference):
+    """As `reference`, for a fully resolved input structure to encode: 42 PD-L1 residues (generated, so encoded)
+    after a 20-residue chain the spec generates from scratch."""
+    import copy
+
+    from rfproteina.datapipes.collate import collate_batch
+    from rfproteina.datapipes.pipeline import build_design_validation_pipeline
+    from rfproteina.inference_utils.datasets import ConditionSpecDataset
+
+    from jrfd4_proteina import convert
+
+    torch_model, jax_model, _, _ = reference
+    spec = {"structure": {"input": str(Path(__file__).parent / "data" / "5o45_cropped.cif.zst"),
+                          "contig": "20, /0, A83-124"}}
+    dataset = ConditionSpecDataset(data=copy.deepcopy(spec), transform=build_design_validation_pipeline(), name="test")
+    torch_batch = collate_batch(
+        [dataset[0]], schema="rfproteina.datapipes.schema.proteina.ProteinaDataSample", fixed_dimensions=None
+    )
+    torch_batch["coords_nm"] = torch_batch["coords"] / 10.0
+    torch_batch["coord_mask"] = torch_batch["atom37_mask"]
+    return torch_model, jax_model, torch_batch, convert.batch_from_reference(torch_batch)[0]

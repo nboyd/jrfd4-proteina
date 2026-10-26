@@ -59,7 +59,7 @@ def _noise_config(cfg) -> NoiseConfig:
 
 
 def convert_model(proteina) -> RFD4Proteina:
-    """Convert a loaded `rfproteina.proteina.Proteina` (flow network + AE decoder)."""
+    """Convert a loaded `rfproteina.proteina.Proteina` (flow network + AE encoder and decoder)."""
     proteina = proteina.eval().float()
     fm = proteina.cfg_exp.product_flowmatcher
     if list(fm) != ["bb_ca", "local_latents"]:
@@ -67,6 +67,7 @@ def convert_model(proteina) -> RFD4Proteina:
     return RFD4Proteina(
         flow=from_torch(proteina.nn),
         decoder=from_torch(proteina.autoencoder.decoder),
+        encoder=from_torch(proteina.autoencoder.encoder),
         noise_bb_ca=_noise_config(fm.bb_ca),
         noise_local_latents=_noise_config(fm.local_latents),
         latent_dim=int(fm.local_latents.dim),
