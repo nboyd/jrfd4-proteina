@@ -1298,7 +1298,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'", specifier = ">=0.12.0.1" },
     { name = "jaxtyping", specifier = ">=0.2.36" },
     { name = "numpy", specifier = ">=2.1" },
-    { name = "rfd4-proteina", marker = "extra == 'convert'", specifier = "==0.0.3" },
+    { name = "rfd4-proteina", marker = "extra == 'convert'", specifier = ">=0.0.3" },
     { name = "safetensors", marker = "extra == 'convert'", specifier = ">=0.8.0" },
     { name = "torch", marker = "extra == 'convert'", specifier = ">=2.11" },
 ]

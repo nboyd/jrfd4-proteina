@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 convert = [
-    "rfd4-proteina==0.0.3",
+    "rfd4-proteina>=0.0.3",
     "safetensors>=0.8.0",
     "torch>=2.11",
 ]
