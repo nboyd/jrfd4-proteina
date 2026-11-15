@@ -163,20 +163,33 @@ class LocalLatentsTransformer(eqx.Module):
         c = self.cond_factory(batch, inputs)
         return self.transition_c_2(self.transition_c_1(c, batch.padding_mask), batch.padding_mask)
 
-    def __call__(self, batch: Batch, inputs: FlowInputs, n_recycle: int) -> FlowOutput:
-        """Run `n_recycle` trunk passes (at least one); gradients flow through the last pass only."""
+    def __call__(
+        self,
+        batch: Batch,
+        inputs: FlowInputs,
+        n_recycle: int | Int[Array, ""],
+        condition_on_remaining: bool | Bool[Array, ""] = True,
+    ) -> FlowOutput:
+        """Run `n_recycle` trunk passes (at least one); gradients flow through the last pass only.
+
+        Passes after the first are told how many remain unless `condition_on_remaining` is false (training
+        withholds it at random). Both arguments may be JAX scalars, so one compiled function serves every depth.
+        """
         mask = batch.padding_mask
         c_first = self.conditioning(batch, inputs)
         s_init = self.init_repr_factory(batch, inputs).astype(jnp.float32) * mask[:, None]  # f32 residual streams
         z_init = self.pair_repr_builder(batch, inputs).astype(jnp.float32)
-        n_recycle = max(1, n_recycle)
-        condition_remaining = self.recycle_dim is not None and n_recycle > 1
+        static = isinstance(n_recycle, int)
+        n_recycle = max(1, n_recycle) if static else jnp.maximum(1, n_recycle)
+        condition_remaining = (
+            self.recycle_dim is not None and (not static or n_recycle > 1) and condition_on_remaining is not False
+        )
 
         def trunk_pass(cycle: Int[Array, ""], s, z):
             if condition_remaining:
                 remaining = jax.nn.one_hot(jnp.minimum(n_recycle - cycle - 1, self.recycle_dim - 1), self.recycle_dim)
                 c_later = self.conditioning(batch, dataclasses.replace(inputs, recycle_remaining=remaining))
-                c = jnp.where(cycle == 0, c_first, c_later)
+                c = jnp.where((cycle > 0) & condition_on_remaining, c_later, c_first)
             else:
                 c = c_first
             z_in = z_init + self.z_cycle_proj(self.z_cycle_norm(z))
@@ -187,7 +200,7 @@ class LocalLatentsTransformer(eqx.Module):
         s, z = jax.lax.fori_loop(
             0, n_recycle - 1, lambda cycle, sz: jax.lax.stop_gradient(trunk_pass(cycle, *sz)), (s, z)
         )
-        s, _ = trunk_pass(jnp.array(n_recycle - 1), s, z)
+        s, _ = trunk_pass(jnp.asarray(n_recycle - 1), s, z)
 
         emit_bb_ca, emit_latents = batch.design_mask, batch.latent_mask
         s_detached = jax.lax.stop_gradient(s)

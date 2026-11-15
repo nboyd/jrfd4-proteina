@@ -1,7 +1,7 @@
 [project]
 name = "jrfd4-proteina"
 version = "0.1.0"
-description = "JAX/Equinox port of RFD4-Proteina inference: flow network, sampler and autoencoder"
+description = "JAX/Equinox port of RFD4-Proteina: flow network, sampler, autoencoder and LoRA fine-tuning"
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "NOTICE"]
@@ -26,6 +26,9 @@ convert = [
 cuda = [
     "jax[cuda12]>=0.12.0.1",
 ]
+train = [
+    "optax>=0.2.9",
+]
 
 [build-system]
 requires = ["uv_build>=0.8.17,<0.9.0"]
@@ -34,6 +37,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "beartype>=0.23.1",
+    "optax>=0.2.9",
     "pytest>=9.1.1",
     "ruff>=0.17.2",
 ]

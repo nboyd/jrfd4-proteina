@@ -1,8 +1,8 @@
 # jrfd4-proteina
 
-A JAX/Equinox port of the inference path of [RFD4-Proteina](https://github.com/RosettaCommons/RFD4-Proteina)
-(Baker Lab × NVIDIA GenAIR): the flow network, the flow-matching sampler and the autoencoder.
-Everything is single-example, pure and jittable; batch with `jax.vmap`.
+A JAX/Equinox port of [RFD4-Proteina](https://github.com/RosettaCommons/RFD4-Proteina)
+(Baker Lab × NVIDIA GenAIR): the flow network, the flow-matching sampler, the autoencoder, and LoRA
+fine-tuning of the flow network. Everything is single-example, pure and jittable; batch with `jax.vmap`.
 
 RFD4-Proteina is a **flow-matching** model (Proteina lineage), not an AF3-style EDM diffusion model. It
 integrates two modalities jointly from noise (t=0) to data (t=1): per-token CA coordinates (nm) and
@@ -16,6 +16,7 @@ structure to latents, for partial diffusion from an input structure).
 ```bash
 uv sync                         # core (jax, equinox): torch-free
 uv sync --extra convert         # + torch and rfd4-proteina, for weight conversion and featurization
+uv sync --extra train           # + optax, for fine-tuning
 uv sync --extra cuda            # + jax[cuda12]
 ```
 
@@ -87,7 +88,11 @@ residue types: Jensen-Shannon distance 0.016, chi-squared p 0.76).
 | `SamplingConfig` / `release_sampling_config()` | schedules, TSR temperature, recycle bands (reference defaults: 60 steps, medium front-loaded recycling). Per modality: a time grid (`Log(p)`, `Power(p)`, `Uniform()`), `tsr=TSR(k, sigma)` or `None` (plain ODE), and `stochastic=Stochastic(g, band, noise_scale)` or `None` (deterministic). `TSR` and `noise_scale` fields may be JAX scalars, so one compiled sampler can `vmap` over temperatures |
 | `Batch` | typed design inputs; `Batch.from_reference` adapts the reference collated batch |
 | `convert.load / convert_model / featurize / batch_from_reference` | torch-dependent conversion |
-| `io.save / io.load` | torch-free serialization |
+| `convert.train_loader(overrides)` / `convert.training_examples(batch)` | the reference training dataloader as stacked `training.Example`s |
+| `lora.init / attach / merge / split` | LoRA adapters as a pytree beside the model (see below) |
+| `training.train_step(adapters, opt_state, model, optimizer, examples, key, config)` | one jitted fine-tuning update; `training.batch_loss`, `example_loss`, `losses` underneath |
+| `optim.optimizer(learning_rate)` / `optim.muon` | the reference's clipped Muon, as an optax transformation |
+| `io.save / io.load` | torch-free serialization (model or adapters) |
 
 ### Example: PD-L1 binder
 
@@ -128,6 +133,60 @@ design = partial_diffuse(model, batch, config, clean, key=jax.random.key(1), fra
 
 Every atom of an encoded residue must be resolved: the reference's training pipeline drops residues with missing
 atoms, and NaN coordinates make every latent NaN.
+
+### LoRA fine-tuning
+
+The reference fine-tunes the flow network with rank-32 LoRA adapters on the attention projections (`to_qkv`,
+`to_out_node`) of every trunk layer, the AE frozen. Here the adapters are a small pytree beside the model: the
+only trainable parameters, attached inside the loss. Data loading stays with the reference (torch); the losses,
+the optimizer and the update are JAX.
+
+```python
+from jrfd4_proteina import convert, io, lora, optim, training
+
+base = convert.load("nvidia/RFD4-Proteina")                     # frozen
+model = base.bfloat16()                                         # train in bf16 mixed precision
+config = training.release_training_config()
+examples = convert.train_loader(["experiment=tutorial/finetune_test_dataset", "dataloaders.batch_size=4"])
+
+key = jax.random.key(0)
+adapters = lora.init(model.flow, key, rank=32, alpha=64.0)      # {path: LoRA(a, b)}, 2M parameters
+optimizer = optim.optimizer(5e-5)                               # gradient clipping + Muon
+opt_state = optimizer.init(adapters)
+for step, batch in zip(range(1000), examples):
+    adapters, opt_state, losses = training.train_step(
+        adapters, opt_state, model, optimizer, batch, jax.random.fold_in(key, step), config)
+
+io.save(adapters, "adapters")                                   # later: io.load("adapters")
+tuned = eqx.tree_at(lambda m: m.flow, base, lora.merge(base.flow, adapters))   # plain weights again
+design = sample(tuned.bfloat16(), batch, release_sampling_config(), key=key)
+```
+
+`examples/finetune_lora.py` is this loop with logging and an EMA of the adapters (`training.ema`).
+
+* **Data.** `convert.train_loader` composes the reference's `training_proteina` Hydra config with your overrides
+  and yields its collated batches as stacked `Example`s (a `Batch` plus `Targets`), padded to a fixed token
+  count so one compilation serves every step. The tutorial dataset is `test_dataset/test_dataset.tar.gz` in the
+  Hugging Face repo, unpacked into `$DATA_PATH/test_dataset` (default `~/.cache/jrfd4_proteina`).
+* **Objective** (`training.example_loss`). Per-modality times from the training distributions, the structure
+  encoded by the frozen AE, `x_t = (1 - t) x_0 + t x_1`; then the squared error of the clean prediction on resolved
+  generated tokens, weighted by `1 / (1 - t)^2`, plus the sequence and insertion cross entropies and the chirality
+  (signed-volume) loss. With `exploration_k = 4`, four corruptions sharing `t` are scored without gradients and
+  only the best is trained on. The recycle depth (Poisson, 1-9 passes, gradients through the last) is a traced
+  scalar, so it does not recompile.
+* **Optimizer.** With only adapters trainable the reference's Muon/Adam split puts everything on Muon
+  (`match_rms_adamw` scaling, weight decay 0.1, gradient norm clipped to 1). `optim.muon` matches
+  `torch.optim.Muon` except that its Newton-Schulz iteration runs in float32, not bf16.
+  `optim.optimizer(lr, accumulate=n)` averages `n` steps' gradients per update.
+* **Precision.** Adapters stay float32 and are added after the matmuls (`LoRALinear`), so training with
+  `model.bfloat16()` does not round them away. `lora.merge` folds them into float32 weights for sampling.
+* **PEFT.** A reference model with PEFT adapters converts directly (`convert.convert_model`, then
+  `lora.split(model.flow)`), so reference-trained adapters can be used here.
+
+Losses and adapter gradients match the reference on its own training batches to fp32 precision
+(`tests/test_training.py`). One step at batch 4, 256 tokens, four noise candidates takes ~1.2 s and ~11 GB in
+bf16 on an H100. The released recipe reaches an effective batch of 256 examples per update (128 GPUs, two
+accumulated steps); scale `dataloaders.batch_size` and `accumulate` to your hardware.
 
 ### Beam search
 

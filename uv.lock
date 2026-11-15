@@ -9,6 +9,15 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "absl-py"
+version = "2.5.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1f/1d/58e2b5a6e4d703ccb2a029943d665974cb3d5a4fb2b3e3675dd03a9df10e/absl_py-2.5.1.tar.gz", hash = "sha256:286e71c82c1a38e75bbcf185f9b37d0305ad7786535107cb49bf4df9ff2e1f95", size = 118387, upload-time = "2026-10-09T08:38:58.037Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/7d/01e62f59e4166af1be6238d9f2b7f3453630c51b8044b412d05b5606532a/absl_py-2.5.1-py3-none-any.whl", hash = "sha256:721200f2f0e9960f2ca9dc3a2a706b201f5f75d812c158f059cbbe29eeafbdb8", size = 137673, upload-time = "2026-10-09T08:38:56.629Z" },
+]
+
+[[package]]
 name = "accelerate"
 version = "1.15.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1282,10 +1291,14 @@ convert = [
 cuda = [
     { name = "jax", extra = ["cuda12"] },
 ]
+train = [
+    { name = "optax" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "beartype" },
+    { name = "optax" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -1298,15 +1311,17 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'", specifier = ">=0.12.0.1" },
     { name = "jaxtyping", specifier = ">=0.2.36" },
     { name = "numpy", specifier = ">=2.1" },
+    { name = "optax", marker = "extra == 'train'", specifier = ">=0.2.9" },
     { name = "rfd4-proteina", marker = "extra == 'convert'", specifier = ">=0.0.3" },
     { name = "safetensors", marker = "extra == 'convert'", specifier = ">=0.8.0" },
     { name = "torch", marker = "extra == 'convert'", specifier = ">=2.11" },
 ]
-provides-extras = ["convert", "cuda"]
+provides-extras = ["convert", "cuda", "train"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "beartype", specifier = ">=0.23.1" },
+    { name = "optax", specifier = ">=0.2.9" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.17.2" },
 ]
@@ -2370,6 +2385,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/8c/b9/2ac072041e899a52f20cf9510850ff58295003aa75525e58343591b0cbfb/opt_einsum-3.4.0.tar.gz", hash = "sha256:96ca72f1b886d148241348783498194c577fa30a8faac108586b14f1ba4473ac", size = 63004, upload-time = "2024-09-26T14:33:24.483Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/23/cd/066e86230ae37ed0be70aae89aabf03ca8d9f39c8aea0dec8029455b5540/opt_einsum-3.4.0-py3-none-any.whl", hash = "sha256:69bb92469f86a1565195ece4ac0323943e83477171b91d24c35afe028a90d7cd", size = 71932, upload-time = "2024-09-26T14:33:23.039Z" },
+]
+
+[[package]]
+name = "optax"
+version = "0.2.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "jax" },
+    { name = "jaxlib" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/45/103ec6ed4594cf8dec67e29ef3f72bb5530a86db4e28a354110e8fc8425b/optax-0.2.9.tar.gz", hash = "sha256:fcaa7e34c37ab2875c72d91e55374ff02a7ef6463b79fdb45bd3d65c6d4d61c5", size = 314052, upload-time = "2026-11-11T18:36:36.667Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/18/3ebc9263daccd4c41a5d90785f467eb24d450355f8c7089906d154677797/optax-0.2.9-py3-none-any.whl", hash = "sha256:ec037b3975685e2550f9cc4994feda1492162ff9b812a0ea5face18c8fdf2948", size = 416967, upload-time = "2026-11-11T18:36:35.084Z" },
 ]
 
 [[package]]
