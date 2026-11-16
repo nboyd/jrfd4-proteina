@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 
 import equinox as eqx
 import jax
@@ -305,7 +306,9 @@ def batch_loss(
     return loss.mean(), jax.tree.map(jnp.mean, terms)
 
 
-@eqx.filter_jit
+# `jax.jit`, not `eqx.filter_jit`: the latter waits for the result, so the host could not load the next batch
+# while the device runs this step.
+@partial(jax.jit, static_argnames=("optimizer", "config"))
 def train_step(
     adapters: lora.Adapters,
     opt_state,
@@ -316,7 +319,8 @@ def train_step(
     config: TrainingConfig,
 ):
     """One optimizer update of `adapters`. `optimizer` is an optax `GradientTransformation`, e.g.
-    `jrfd4_proteina.optim.optimizer()`. Returns `(adapters, opt_state, mean Losses)`."""
+    `jrfd4_proteina.optim.optimizer()`. Returns `(adapters, opt_state, mean Losses)` without waiting for them:
+    reading a loss value does wait, so log sparingly."""
     (_, terms), grads = eqx.filter_value_and_grad(batch_loss, has_aux=True)(adapters, model, examples, key, config)
     updates, opt_state = optimizer.update(grads, opt_state, adapters)
     return eqx.apply_updates(adapters, updates), opt_state, terms

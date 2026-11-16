@@ -184,8 +184,9 @@ design = sample(tuned.bfloat16(), batch, release_sampling_config(), key=key)
   `lora.split(model.flow)`), so reference-trained adapters can be used here.
 
 Losses and adapter gradients match the reference on its own training batches to fp32 precision
-(`tests/test_training.py`). One step at batch 4, 256 tokens, four noise candidates takes ~1.2 s and ~11 GB in
-bf16 on an H100. The released recipe reaches an effective batch of 256 examples per update (128 GPUs, two
+(`tests/test_training.py`). One step at batch 4, 256 tokens, four noise candidates takes ~1.0 s and ~11 GB in
+bf16 on an H100. Featurizing a batch takes ~0.35 s: give the loader worker processes
+(`dataloaders.num_workers=4`, `dataloaders.multiprocessing_context=spawn`) so that it overlaps the step. The released recipe reaches an effective batch of 256 examples per update (128 GPUs, two
 accumulated steps); scale `dataloaders.batch_size` and `accumulate` to your hardware.
 
 ### Beam search

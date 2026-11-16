@@ -26,7 +26,13 @@ def main() -> None:
     model = convert.load("nvidia/RFD4-Proteina").bfloat16()  # frozen; bf16 mixed precision, as the reference trains
     config = training.release_training_config()
     examples = convert.train_loader(
-        ["experiment=tutorial/finetune_test_dataset", f"dataloaders.batch_size={args.batch_size}"]
+        [
+            "experiment=tutorial/finetune_test_dataset",
+            f"dataloaders.batch_size={args.batch_size}",
+            "dataloaders.num_workers=4",  # featurize while the device works on the previous step
+            "dataloaders.prefetch_factor=2",
+            "dataloaders.multiprocessing_context=spawn",
+        ]
     )
 
     key = jax.random.key(0)

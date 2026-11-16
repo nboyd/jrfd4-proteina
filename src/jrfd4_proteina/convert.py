@@ -159,6 +159,10 @@ def train_loader(overrides: Sequence[str] = ()) -> Iterator[Example]:
     (`experiment=...`, `dataloaders.batch_size=...`, `dataloaders.num_workers=...`, `_max_tokens=...`), so
     datasets, design tasks, cropping and padding to a fixed token count are exactly as it trains with. Each
     example appears once: noise candidates (`exploration_k`) are drawn in JAX.
+
+    Featurizing a batch takes a few tenths of a second. With `dataloaders.num_workers=0` that is added to every
+    step; with worker processes (`dataloaders.num_workers=4`, `dataloaders.multiprocessing_context=spawn`) it
+    overlaps the device's work.
     """
     import hydra
     from hydra import compose, initialize_config_dir
@@ -168,7 +172,9 @@ def train_loader(overrides: Sequence[str] = ()) -> Iterator[Example]:
     os.environ.setdefault("DATA_PATH", str(Path.home() / ".cache" / "jrfd4_proteina"))
     register_resolvers()
     with initialize_config_dir(config_dir=str(reference_config_dir()), version_base="1.3"):
-        cfg = compose("training_proteina", overrides=[*overrides, "training.exploration_k=1"])
+        # Candidates are drawn in JAX; batches leave as numpy, so there is nothing to pin.
+        forced = ["training.exploration_k=1", "dataloaders.pin_memory=false"]
+        cfg = compose("training_proteina", overrides=[*overrides, *forced])
     built = recursively_instantiate_datasets_and_samplers(cfg.datasets.train)
     loader_cfg = hydra.utils.instantiate(cfg.dataloaders.train)
     batches_per_epoch = cfg.opt.steps_per_epoch * cfg.opt.accumulate_grad_batches
