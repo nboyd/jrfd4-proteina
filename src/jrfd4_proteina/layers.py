@@ -31,6 +31,37 @@ class Linear(AbstractFromTorch):
         return (y if self.bias is None else y + self.bias).astype(self.weight.dtype)
 
 
+@register_from_torch("peft.tuners.lora.layer.Linear")
+class LoRALinear(Linear):
+    """A `Linear` with a low-rank update: `x W^T + scale * (x A^T) B^T`.
+
+    The two products are added after the matmuls, never folded into `weight`, so bf16 base weights do not round
+    the update away. `a` and `b` stay float32 (the trainable master weights) and are cast to the base weights'
+    dtype per call; see `jrfd4_proteina.lora`.
+    """
+
+    a: Float[Array, "R In"] = eqx.field(kw_only=True)
+    b: Float[Array, "Out R"] = eqx.field(kw_only=True)
+    scale: float = eqx.field(static=True, kw_only=True)
+
+    @classmethod
+    def from_torch(cls, m) -> LoRALinear:
+        (name,) = m.active_adapters
+        if m.merged or type(m.lora_dropout[name]).__name__ != "Identity" or m.lora_A[name].bias is not None:
+            raise NotImplementedError("only unmerged PEFT LoRA without dropout or adapter biases is ported")
+        base = from_torch(m.base_layer)
+        return cls(base.weight, base.bias, a=from_torch(m.lora_A[name].weight), b=from_torch(m.lora_B[name].weight),
+                   scale=float(m.scaling[name]))
+
+    def __call__(self, x: Float[Array, "... In"]) -> Float[Array, "... Out"]:
+        dtype = self.weight.dtype
+        x = x.astype(dtype)
+        y = jnp.einsum("...i,oi->...o", x, self.weight, preferred_element_type=jnp.float32)
+        h = jnp.einsum("...i,ri->...r", x, self.a.astype(dtype), preferred_element_type=jnp.float32).astype(dtype)
+        y = y + self.scale * jnp.einsum("...r,or->...o", h, self.b.astype(dtype), preferred_element_type=jnp.float32)
+        return (y if self.bias is None else y + self.bias).astype(dtype)
+
+
 def matmul_dtype(module: eqx.Module, dtype) -> eqx.Module:
     """`module` with every `Linear` weight cast to `dtype`: its matmuls' input precision (see module docstring)."""
 

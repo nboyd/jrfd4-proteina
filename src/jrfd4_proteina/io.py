@@ -1,4 +1,4 @@
-"""Torch-free save/load of a converted `RFD4Proteina`."""
+"""Torch-free save/load of a converted `RFD4Proteina`, or of any pytree of arrays (e.g. LoRA adapters)."""
 
 from __future__ import annotations
 
@@ -9,10 +9,8 @@ from pathlib import Path
 import equinox as eqx
 import jax
 
-from jrfd4_proteina.sampling import RFD4Proteina
 
-
-def save(model: RFD4Proteina, path: str | os.PathLike) -> None:
+def save(model, path: str | os.PathLike) -> None:
     """Write `<path>.eqx` (arrays) and `<path>.skeleton.pkl` (structure, shapes and dtypes)."""
     path = Path(path)
     eqx.tree_serialise_leaves(path.with_suffix(".eqx"), model)
@@ -21,7 +19,7 @@ def save(model: RFD4Proteina, path: str | os.PathLike) -> None:
         pickle.dump(skeleton, f)
 
 
-def load(path: str | os.PathLike) -> RFD4Proteina:
+def load(path: str | os.PathLike):
     path = Path(path)
     with open(path.with_suffix(".skeleton.pkl"), "rb") as f:
         skeleton = pickle.load(f)

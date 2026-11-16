@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import copy
 import importlib
+import itertools
 import os
 import random
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -25,6 +26,7 @@ import jrfd4_proteina.model  # noqa: F401
 from jrfd4_proteina.backend import REGISTRY, from_torch
 from jrfd4_proteina.batch import Batch
 from jrfd4_proteina.sampling import NoiseConfig, RFD4Proteina
+from jrfd4_proteina.training import Example, Targets
 
 
 def _resolve(path: str) -> type:
@@ -59,7 +61,10 @@ def _noise_config(cfg) -> NoiseConfig:
 
 
 def convert_model(proteina) -> RFD4Proteina:
-    """Convert a loaded `rfproteina.proteina.Proteina` (flow network + AE encoder and decoder)."""
+    """Convert a loaded `rfproteina.proteina.Proteina` (flow network + AE encoder and decoder).
+
+    PEFT LoRA adapters on the denoiser convert to `LoRALinear`s; `lora.split(model.flow)` separates them.
+    """
     proteina = proteina.eval().float()
     fm = proteina.cfg_exp.product_flowmatcher
     if list(fm) != ["bb_ca", "local_latents"]:
@@ -139,3 +144,50 @@ def featurize(spec: Mapping[str, Mapping], *, seed: int | None = None) -> list[B
             )
             batches.extend(batch_from_reference(collated))
     return batches
+
+
+def training_examples(batch: dict) -> Example:
+    """A reference collated training batch as one stacked `Example` (leading axis: examples), on the host."""
+    arrays = {k: v.detach().cpu().numpy() for k, v in batch.items() if isinstance(v, torch.Tensor)}
+    return Example(Batch.from_reference(arrays), Targets.from_reference(arrays))
+
+
+def train_loader(overrides: Sequence[str] = ()) -> Iterator[Example]:
+    """Stacked `Example`s from the reference training dataloader, without end.
+
+    The loader is the reference's own: its `training_proteina` Hydra config composed with `overrides`
+    (`experiment=...`, `dataloaders.batch_size=...`, `dataloaders.num_workers=...`, `_max_tokens=...`), so
+    datasets, design tasks, cropping and padding to a fixed token count are exactly as it trains with. Each
+    example appears once: noise candidates (`exploration_k`) are drawn in JAX.
+
+    Featurizing a batch takes a few tenths of a second. With `dataloaders.num_workers=0` that is added to every
+    step; with worker processes (`dataloaders.num_workers=4`, `dataloaders.multiprocessing_context=spawn`) it
+    overlaps the device's work.
+    """
+    import hydra
+    from hydra import compose, initialize_config_dir
+    from rfproteina.utils.datasets import assemble_distributed_loader, recursively_instantiate_datasets_and_samplers
+    from rfproteina.utils.hydra import register_resolvers
+
+    os.environ.setdefault("DATA_PATH", str(Path.home() / ".cache" / "jrfd4_proteina"))
+    register_resolvers()
+    with initialize_config_dir(config_dir=str(reference_config_dir()), version_base="1.3"):
+        # Candidates are drawn in JAX; batches leave as numpy, so there is nothing to pin.
+        forced = ["training.exploration_k=1", "dataloaders.pin_memory=false"]
+        cfg = compose("training_proteina", overrides=[*overrides, *forced])
+    built = recursively_instantiate_datasets_and_samplers(cfg.datasets.train)
+    loader_cfg = hydra.utils.instantiate(cfg.dataloaders.train)
+    batches_per_epoch = cfg.opt.steps_per_epoch * cfg.opt.accumulate_grad_batches
+    loader = assemble_distributed_loader(
+        dataset=built["dataset"],
+        sampler=built["sampler"],
+        rank=0,
+        world_size=1,
+        n_examples_per_epoch=batches_per_epoch * loader_cfg["dataloader_params"]["batch_size"],
+        loader_cfg=loader_cfg,
+    )
+    for epoch in itertools.count():
+        if hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)  # reshuffle
+        for batch in loader:
+            yield training_examples(batch)
